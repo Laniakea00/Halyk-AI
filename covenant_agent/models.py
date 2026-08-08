@@ -201,6 +201,7 @@ from covenant_agent.schemas import (  # noqa: E402
     AuditExtractionResult,
     CovenantExtractionResult,
     KycExtractionResult,
+    OtherFact,
     OtherFactsExtractionResult,
 )
 
@@ -269,11 +270,20 @@ class RelatedPartyMatch:
 class LinkedReclassification:
     """An auditor reclassification joined to a specific ledger transaction —
     see linking/reclassification_linking.py:link_reclassifications.
+
+    `action` mirrors AuditReclassification's: "recategorize" (the normal
+    case — original_category/reclassified_category both set),
+    "exclude_from_period" (both None; formulas.py's effective_category
+    treats the transaction as excluded entirely, regardless of category),
+    or "no_change" (informational only — never actually reaches this dict,
+    see reclassification_linking.py, kept here only so the Literal is
+    shared and callers don't need a separate type).
     """
 
     txn_id: str
-    original_category: str
-    reclassified_category: str
+    action: str  # "recategorize" | "exclude_from_period"
+    original_category: str | None
+    reclassified_category: str | None
     reasoning: str
     source_doc_id: str
     match_confidence: float  # 1.0 = exact counterparty + exact amount; lower if fuzzy/ambiguous
@@ -315,6 +325,12 @@ class LinkedScenarioData:
     reclassifications: dict[str, LinkedReclassification]
     unmatched_reclassifications: list[UnmatchedReclassification]
     related_parties: dict[str, RelatedPartyMatch]
+    # Flattened across every audit_report/financial_notes/treasury_memo doc
+    # this scenario matched — see calculation/formulas.py's _resolve_side_sum
+    # for how a fact gets matched to a covenant side by text similarity
+    # (the same match_category_by_text machinery reclassifications already
+    # use), additive to that side's transaction-derived sum.
+    other_facts: tuple[OtherFact, ...] = ()
 
 
 # ---------------------------------------------------------------------------

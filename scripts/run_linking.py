@@ -25,6 +25,7 @@ from covenant_agent.config import DEFAULT_CACHE_DIR, DEFAULT_DATA_DIR  # noqa: E
 from covenant_agent.extraction.cache import load_scenario_facts  # noqa: E402
 from covenant_agent.extraction.pipeline import extract_all_facts  # noqa: E402
 from covenant_agent.linking.pipeline import link_all_scenarios, link_scenario  # noqa: E402
+from covenant_agent.llm_client import print_usage_summary  # noqa: E402
 from covenant_agent.models import LinkedScenarioData  # noqa: E402
 from covenant_agent.resolution.pipeline import run_ingestion  # noqa: E402
 
@@ -98,6 +99,7 @@ def main() -> int:
             args.scenario, bundle.account_id, ingestion.ledger, all_facts[args.scenario], log_dir=log_dir
         )
         print_linking_summary(linked)
+        print_usage_summary()
         return 0
 
     linked_by_scenario, status = link_all_scenarios(ingestion, all_facts, log_dir=log_dir)
@@ -110,6 +112,7 @@ def main() -> int:
     if failed:
         print(f"  FAILED ({len(failed)}): {list(failed)} — re-run with --scenario <id>")
 
+    print_usage_summary()
     return 0
 
 

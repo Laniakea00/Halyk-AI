@@ -16,8 +16,11 @@ import unittest
 from covenant_agent.calculation.evidence import find_evidence
 from covenant_agent.calculation.formulas import (
     InsufficientDataError,
+    _quarter_number,
+    _quarter_start_from_end,
     compare_to_threshold,
     compute_metric,
+    in_period,
 )
 from covenant_agent.models import (
     CategorySpec,
@@ -26,7 +29,7 @@ from covenant_agent.models import (
     RelatedPartyMatch,
     Transaction,
 )
-from covenant_agent.schemas import CovenantClause
+from covenant_agent.schemas import CovenantClause, OtherFact
 
 
 def _txn(txn_id, amount, counterparty="Some Vendor", date="2025-06-01", currency="USD") -> Transaction:
@@ -80,6 +83,7 @@ def _linked(
     txn_category=None,
     reclassifications=None,
     related_parties=None,
+    other_facts=None,
 ) -> LinkedScenarioData:
     return LinkedScenarioData(
         scenario_id="X1",
@@ -89,6 +93,7 @@ def _linked(
         reclassifications=reclassifications or {},
         unmatched_reclassifications=[],
         related_parties=related_parties or {},
+        other_facts=tuple(other_facts or ()),
     )
 
 
@@ -187,6 +192,81 @@ class ComputeMetricRatioTest(unittest.TestCase):
         self.assertAlmostEqual(actual, 10.0)  # only the USD 1000, not the EUR 5000
 
 
+class QuarterPeriodInferenceTest(unittest.TestCase):
+    """Diagnosed on the public dataset: B4's covenant 6.1 measures revenue
+    for "четвёртый финансовый квартал периода, оканчивающегося 2025-12-31"
+    — the source text never states an explicit numeric start date, so 2a
+    correctly extracts period_start=None (nothing more literal to grab),
+    and without inference in_period() had no lower bound at all, silently
+    summing the whole year into a Q4-only test. This is the code-side,
+    deterministic fix — no LLM call involved.
+    """
+
+    def test_quarter_number_recognizes_all_four_ordinal_stems(self) -> None:
+        cases = [
+            ("Выручка за первый квартал", 1),
+            ("Выручка за второй финансовый квартал", 2),
+            ("третьего квартала периода", 3),
+            ("четвёртый финансовый квартал периода, оканчивающегося 2025-12-31", 4),
+            ("четвертый квартал", 4),  # е/ё spelling variant
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(_quarter_number(text), expected)
+
+    def test_quarter_number_recognizes_digit_forms(self) -> None:
+        self.assertEqual(_quarter_number("Revenue for Q4 2025"), 4)
+        self.assertEqual(_quarter_number("за 4-й квартал"), 4)
+
+    def test_quarter_number_none_when_no_quarter_mentioned(self) -> None:
+        self.assertIsNone(_quarter_number("Выручка за отчётный период"))
+
+    def test_quarter_start_matches_calendar_quarter_end(self) -> None:
+        self.assertEqual(_quarter_start_from_end("2025-12-31", 4), "2025-10-01")
+        self.assertEqual(_quarter_start_from_end("2025-03-31", 1), "2025-01-01")
+
+    def test_quarter_start_none_when_end_month_disagrees_with_ordinal(self) -> None:
+        # Text says Q4 but period_end is June — inconsistent, don't guess.
+        self.assertIsNone(_quarter_start_from_end("2025-06-30", 4))
+
+    def test_in_period_infers_q4_start_and_excludes_earlier_transactions(self) -> None:
+        clause = _clause(
+            metric_type="aggregate_amount",
+            numerator_description=None,
+            denominator_description=None,
+            formula_description=(
+                "Выручка за четвёртый финансовый квартал периода, оканчивающегося 2025-12-31"
+            ),
+            period_start=None,
+            period_end="2025-12-31",
+        )
+        q3_txn = _txn("Q3", 1000.0, date="2025-09-30")
+        q4_txn = _txn("Q4", 1000.0, date="2025-10-01")
+        self.assertFalse(in_period(q3_txn, clause))
+        self.assertTrue(in_period(q4_txn, clause))
+
+    def test_in_period_does_not_override_an_explicit_period_start(self) -> None:
+        clause = _clause(
+            formula_description="Выручка за четвёртый квартал",
+            period_start="2025-01-01",  # 2a already gave an explicit (different) bound
+            period_end="2025-12-31",
+        )
+        early_txn = _txn("EARLY", 1000.0, date="2025-02-01")
+        self.assertTrue(in_period(early_txn, clause))  # explicit period_start wins, not inferred Oct 1
+
+    def test_in_period_unchanged_when_no_quarter_language_present(self) -> None:
+        # The other 11 public-dataset scenarios: no quarter wording anywhere
+        # near their period fields — behavior must stay exactly as before
+        # (no lower bound when period_start is None and nothing to infer).
+        clause = _clause(
+            formula_description="Совокупные операционные расходы за отчётный период",
+            period_start=None,
+            period_end="2025-12-31",
+        )
+        old_txn = _txn("OLD", 1000.0, date="2025-01-05")
+        self.assertTrue(in_period(old_txn, clause))
+
+
 class ComputeMetricOtherTypesTest(unittest.TestCase):
     def test_max_single_component_picks_the_larger(self) -> None:
         comp0 = CategorySpec(key="6.2_component_0", covenant_key="6.2", role="component", description="payroll")
@@ -248,6 +328,175 @@ class ComputeMetricOtherTypesTest(unittest.TestCase):
         self.assertAlmostEqual(actual, 500.0)
 
 
+def _fact(fact_description, value, unit="usd") -> OtherFact:
+    return OtherFact(
+        fact_description=fact_description, value=value, unit=unit, period=None, source_quote="quote"
+    )
+
+
+class OtherFactsWiringTest(unittest.TestCase):
+    """Confirmed necessary on the public dataset: P8's 6.1 ("Совокупные
+    обязательства по персоналу") is genuinely payroll transactions *plus*
+    an off-ledger severance-program obligation disclosed in a note, never a
+    ledger transaction. compute_metric must add a matching other_fact's
+    value on top of the transaction-derived sum for the same role.
+    """
+
+    def test_matching_other_fact_adds_to_aggregate_amount_sum(self) -> None:
+        spec = CategorySpec(
+            key="6.1_amount",
+            covenant_key="6.1",
+            role="amount",
+            description=(
+                "Совокупные обязательства по персоналу означают сумму расходов на оплату "
+                "труда и обязательства по программе выходных пособий, сокращения или "
+                "удержания персонала"
+            ),
+        )
+        txns = [_txn("PAY", -2418663.27)]
+        linked = _linked(
+            txns,
+            category_specs=[spec],
+            txn_category={"PAY": "6.1_amount"},
+            other_facts=[_fact("обязательство по программе выходных пособий", 918447.52)],
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            metric_type="aggregate_amount",
+            numerator_description=None,
+            denominator_description=None,
+            formula_description="Совокупные обязательства по персоналу",
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 2418663.27 + 918447.52)
+
+    def test_unmatched_other_fact_does_not_contribute(self) -> None:
+        spec = CategorySpec(key="6.1_amount", covenant_key="6.1", role="amount", description="Капитальные затраты")
+        txns = [_txn("PAY", -500.0)]
+        linked = _linked(
+            txns,
+            category_specs=[spec],
+            txn_category={"PAY": "6.1_amount"},
+            other_facts=[_fact("Совершенно не связанный операционный показатель", 999999.0)],
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            metric_type="aggregate_amount",
+            numerator_description=None,
+            denominator_description=None,
+            formula_description="Капитальные затраты",
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 500.0)
+
+    def test_other_fact_alone_satisfies_insufficient_data_check(self) -> None:
+        # Zero transactions matched, but a real off-ledger fact exists —
+        # must not raise InsufficientDataError.
+        spec = CategorySpec(
+            key="6.1_amount",
+            covenant_key="6.1",
+            role="amount",
+            description="Обязательства по программе выходных пособий персонала",
+        )
+        linked = _linked(
+            [],
+            category_specs=[spec],
+            other_facts=[_fact("обязательства по программе выходных пособий", 918447.52)],
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            metric_type="aggregate_amount",
+            numerator_description=None,
+            denominator_description=None,
+            formula_description="Обязательства",
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 918447.52)
+
+
+class ExcludeFromPeriodReclassificationTest(unittest.TestCase):
+    """Confirmed necessary on the public dataset: B4's 6.1 has an auditor
+    finding that TXN-B4-0026 (an "advance" cargo settlement) must be
+    excluded from the 2025 covenant period entirely, regardless of its
+    category — not a recategorization, a full exclusion.
+    """
+
+    def _reclass(self, txn_id: str, action: str) -> LinkedReclassification:
+        return LinkedReclassification(
+            txn_id=txn_id,
+            action=action,
+            original_category=None,
+            reclassified_category=None,
+            reasoning="test",
+            source_doc_id="doc1",
+            match_confidence=1.0,
+            was_ambiguous=False,
+        )
+
+    def test_excluded_transaction_does_not_count_toward_the_sum(self) -> None:
+        amount_spec = CategorySpec(key="6.1_amount", covenant_key="6.1", role="amount", description="revenue")
+        txns = [_txn("REAL", 3084375.68), _txn("ADVANCE", 979403.89)]
+        linked = _linked(
+            txns,
+            category_specs=[amount_spec],
+            txn_category={"REAL": "6.1_amount", "ADVANCE": "6.1_amount"},
+            reclassifications={"ADVANCE": self._reclass("ADVANCE", "exclude_from_period")},
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            metric_type="aggregate_amount",
+            numerator_description=None,
+            denominator_description=None,
+            formula_description="revenue",
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 3084375.68)  # ADVANCE excluded entirely
+
+    def test_reverting_the_exclusion_includes_it_again(self) -> None:
+        amount_spec = CategorySpec(key="6.1_amount", covenant_key="6.1", role="amount", description="revenue")
+        txns = [_txn("REAL", 3084375.68), _txn("ADVANCE", 979403.89)]
+        linked = _linked(
+            txns,
+            category_specs=[amount_spec],
+            txn_category={"REAL": "6.1_amount", "ADVANCE": "6.1_amount"},
+            reclassifications={"ADVANCE": self._reclass("ADVANCE", "exclude_from_period")},
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            metric_type="aggregate_amount",
+            numerator_description=None,
+            denominator_description=None,
+            formula_description="revenue",
+        )
+        actual = compute_metric(clause, linked, revert_txn_id="ADVANCE")
+        self.assertAlmostEqual(actual, 3084375.68 + 979403.89)
+
+    def test_exclude_from_period_also_applies_to_related_party_sum(self) -> None:
+        related = RelatedPartyMatch(
+            ledger_counterparty="Some Vendor",
+            kyc_name="Some Vendor",
+            ownership_pct=50.0,
+            threshold_pct=20.0,
+            is_related=True,
+            basis="test",
+        )
+        txns = [_txn("RP1", -1000.0, counterparty="Some Vendor")]
+        linked = _linked(
+            txns,
+            related_parties={"Some Vendor": related},
+            reclassifications={"RP1": self._reclass("RP1", "exclude_from_period")},
+        )
+        clause = _clause(
+            covenant_key="6.3",
+            metric_type="aggregate_amount",
+            numerator_description=None,
+            denominator_description=None,
+            formula_description="платежи в пользу связанных сторон",
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 0.0)
+
+
 class CompareToThresholdTest(unittest.TestCase):
     def test_max_direction(self) -> None:
         self.assertEqual(compare_to_threshold(0.5, 1.0, "max"), "COMPLIANT")
@@ -282,6 +531,7 @@ class FindEvidenceTest(unittest.TestCase):
         # the counterfactual, per the case's own definition.
         reclass = LinkedReclassification(
             txn_id="RECLASS",
+            action="recategorize",
             original_category="consulting",
             reclassified_category="operating expenses",
             reasoning="test",
@@ -338,6 +588,7 @@ class FindEvidenceTest(unittest.TestCase):
         # a valid counterfactual" and skipped, not raise out of find_evidence.
         reclass = LinkedReclassification(
             txn_id="RECLASS",
+            action="recategorize",
             original_category="consulting",
             reclassified_category="operating expenses",
             reasoning="test",

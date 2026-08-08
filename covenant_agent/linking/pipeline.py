@@ -19,6 +19,7 @@ module's categorization call previously had no try/except at all.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 from covenant_agent.linking.categories import derive_category_specs
@@ -26,10 +27,90 @@ from covenant_agent.linking.reclassification_linking import link_reclassificatio
 from covenant_agent.linking.related_parties import resolve_related_parties
 from covenant_agent.linking.transaction_categorization import UNCLASSIFIED, categorize_transactions
 from covenant_agent.models import IngestionResult, LinkedScenarioData, ScenarioFacts, Transaction
+from covenant_agent.schemas import AuditExtractionResult, OtherFact
 
 logger = logging.getLogger(__name__)
 
 STATUS_OK = "ok"
+
+
+def _apply_amount_corrections(
+    scenario_id: str,
+    transactions: list[Transaction],
+    audit_reports: "tuple[tuple[str, AuditExtractionResult], ...]",
+) -> list[Transaction]:
+    """Patch Transaction.amount for every txn_id a financial_notes/audit_report/
+    treasury_memo disclosure names a corrected true amount for — a dirty
+    ledger row (amount=None, or an export glitch) gets the auditor's own
+    stated true value applied *before* categorization/calculation ever
+    see it, rather than being carried as a fact no downstream layer reads.
+    Confirmed necessary on the public dataset: P8's TXN-P8-0031 and P7's
+    TXN-P7-0033 both have amount=None in the raw ledger and a disclosed
+    true amount in a supporting document (see schemas.py's
+    TransactionAmountCorrection).
+
+    Applied once per txn_id (first disclosure wins if more than one
+    document names the same txn_id, logged either way) — logs every patch
+    explicitly, at WARNING level, so it's never a silent substitution.
+    """
+    corrections: dict[str, tuple[float, str, str]] = {}  # txn_id -> (amount, doc_id, reasoning)
+    for doc_id, audit in audit_reports:
+        for item in audit.transaction_amount_corrections:
+            if item.txn_id in corrections:
+                logger.warning(
+                    "Scenario %s: txn %s already has a correction from %s — a second "
+                    "correction from %s also names it; keeping the first.",
+                    scenario_id,
+                    item.txn_id,
+                    corrections[item.txn_id][1],
+                    doc_id,
+                )
+                continue
+            corrections[item.txn_id] = (item.corrected_amount, doc_id, item.reasoning)
+
+    if not corrections:
+        return transactions
+
+    unapplied = set(corrections)
+    patched: list[Transaction] = []
+    for txn in transactions:
+        correction = corrections.get(txn.txn_id)
+        if correction is None:
+            patched.append(txn)
+            continue
+        corrected_amount, doc_id, reasoning = correction
+        logger.warning(
+            "Scenario %s: txn %s amount patched from %r to %.2f per disclosure in %s "
+            "(%s) — using the patched value for categorization and calculation.",
+            scenario_id,
+            txn.txn_id,
+            txn.amount,
+            corrected_amount,
+            doc_id,
+            reasoning,
+        )
+        patched.append(replace(txn, amount=corrected_amount))
+        unapplied.discard(txn.txn_id)
+
+    for missing_txn_id in unapplied:
+        logger.warning(
+            "Scenario %s: a disclosure names txn_id %r for an amount correction, but no "
+            "transaction with that ID exists in this scenario's ledger — ignoring.",
+            scenario_id,
+            missing_txn_id,
+        )
+
+    return patched
+
+
+def _collect_other_facts(
+    audit_reports: "tuple[tuple[str, AuditExtractionResult], ...]",
+) -> tuple[OtherFact, ...]:
+    """Every OtherFact across every audit_report/financial_notes/treasury_memo
+    disclosure for this scenario, flattened — see formulas.py's
+    _resolve_side_sum for how these get matched to a covenant side.
+    """
+    return tuple(fact for _doc_id, audit in audit_reports for fact in audit.other_facts)
 
 
 def link_scenario(
@@ -41,6 +122,7 @@ def link_scenario(
     log_dir: Path | None = None,
 ) -> LinkedScenarioData:
     transactions = [t for t in ledger if t.account_id == account_id]
+    transactions = _apply_amount_corrections(scenario_id, transactions, facts.audit_reports)
     logger.info(
         "Scenario %s: %d ledger transactions on account %s.",
         scenario_id,
@@ -102,6 +184,7 @@ def link_scenario(
         reclassifications=reclassifications,
         unmatched_reclassifications=unmatched,
         related_parties=related_parties,
+        other_facts=_collect_other_facts(facts.audit_reports),
     )
 
 

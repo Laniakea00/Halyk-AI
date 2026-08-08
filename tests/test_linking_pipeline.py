@@ -10,12 +10,13 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from covenant_agent.linking.pipeline import link_all_scenarios, link_scenario
+from covenant_agent.linking.pipeline import _apply_amount_corrections, link_all_scenarios, link_scenario
 from covenant_agent.linking.transaction_categorization import UNCLASSIFIED
 from covenant_agent.models import IngestionResult, ScenarioBundle, ScenarioFacts, Transaction
+from covenant_agent.schemas import AuditExtractionResult, TransactionAmountCorrection
 
 
-def _txn(txn_id: str, account_id: str) -> Transaction:
+def _txn(txn_id: str, account_id: str, amount: float | None = -100.0) -> Transaction:
     return Transaction(
         txn_id=txn_id,
         date="2025-06-01",
@@ -23,13 +24,72 @@ def _txn(txn_id: str, account_id: str) -> Transaction:
         scenario_id="X",
         counterparty="Some Vendor",
         description="test",
-        amount=-100.0,
+        amount=amount,
         currency="USD",
     )
 
 
 def _facts() -> ScenarioFacts:
     return ScenarioFacts(scenario_id="X", covenants=None, kyc=None)
+
+
+def _correction_audit(txn_id: str, corrected_amount: float) -> AuditExtractionResult:
+    return AuditExtractionResult(
+        report_reference=None,
+        is_final_position=True,
+        reclassifications=[],
+        transaction_amount_corrections=[
+            TransactionAmountCorrection(
+                txn_id=txn_id,
+                corrected_amount=corrected_amount,
+                reasoning="сумма не отражена в выгрузке реестра",
+                source_quote="quote",
+            )
+        ],
+    )
+
+
+class ApplyAmountCorrectionsTest(unittest.TestCase):
+    """Confirmed necessary on the public dataset: P8's TXN-P8-0031 and P7's
+    TXN-P7-0033 both have amount=None in the raw ledger, with the true
+    value disclosed in a financial_notes/treasury_memo document.
+    """
+
+    def test_dirty_row_amount_is_patched(self) -> None:
+        txns = [_txn("TXN-P8-0031", "ACC-1", amount=None)]
+        audit_reports = (("doc1", _correction_audit("TXN-P8-0031", 884204.16)),)
+        patched = _apply_amount_corrections("P8", txns, audit_reports)
+        self.assertEqual(patched[0].amount, 884204.16)
+        # Every other field is untouched.
+        self.assertEqual(patched[0].txn_id, "TXN-P8-0031")
+        self.assertEqual(patched[0].counterparty, "Some Vendor")
+
+    def test_transactions_without_a_correction_are_untouched(self) -> None:
+        txns = [_txn("TXN-1", "ACC-1", amount=-500.0)]
+        audit_reports = (("doc1", _correction_audit("TXN-DIFFERENT", 1.0)),)
+        patched = _apply_amount_corrections("X", txns, audit_reports)
+        self.assertEqual(patched[0].amount, -500.0)
+
+    def test_no_corrections_returns_the_same_list_unchanged(self) -> None:
+        txns = [_txn("TXN-1", "ACC-1")]
+        patched = _apply_amount_corrections("X", txns, ())
+        self.assertEqual(patched, txns)
+
+    def test_correction_for_unknown_txn_id_is_ignored_not_crashed(self) -> None:
+        txns = [_txn("TXN-1", "ACC-1")]
+        audit_reports = (("doc1", _correction_audit("TXN-DOES-NOT-EXIST", 1.0)),)
+        patched = _apply_amount_corrections("X", txns, audit_reports)
+        self.assertEqual(len(patched), 1)
+        self.assertEqual(patched[0].amount, -100.0)
+
+    def test_conflicting_corrections_keep_the_first(self) -> None:
+        txns = [_txn("TXN-1", "ACC-1", amount=None)]
+        audit_reports = (
+            ("doc1", _correction_audit("TXN-1", 100.0)),
+            ("doc2", _correction_audit("TXN-1", 200.0)),
+        )
+        patched = _apply_amount_corrections("X", txns, audit_reports)
+        self.assertEqual(patched[0].amount, 100.0)
 
 
 class LinkScenarioCategorizationFailureTest(unittest.TestCase):

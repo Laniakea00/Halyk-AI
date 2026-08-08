@@ -158,55 +158,12 @@ class KycExtractionResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 2b: Auditor reclassification fact extraction
-# ---------------------------------------------------------------------------
-
-
-class AuditReclassification(BaseModel):
-    counterparty_name: Optional[str] = Field(
-        description="Counterparty named in this reclassification finding, if any is stated. "
-        "Null if the finding does not name a specific counterparty."
-    )
-    amount: Optional[float] = Field(
-        description="The dollar amount cited for this reclassification, as a positive number, "
-        "if the report states one. Null if no specific amount is cited."
-    )
-    transaction_date_or_period: Optional[str] = Field(
-        description="Any date or period stated for the reclassified item (ISO date if exact, "
-        "otherwise as stated, e.g. 'Q1 2025'). Null if none stated."
-    )
-    original_category: str = Field(
-        description="The category the item was originally recorded under, in the source "
-        "language."
-    )
-    reclassified_category: str = Field(
-        description="The category the auditor reassigned the item to, in the source language."
-    )
-    reasoning: str = Field(
-        description="The auditor's stated reason for the reclassification, in the source "
-        "language."
-    )
-    source_quote: str = Field(description="The finding's own text, as exactly as possible.")
-
-
-class AuditExtractionResult(BaseModel):
-    report_reference: Optional[str] = Field(
-        description="The report's own reference/engagement number, if stated (e.g. "
-        "'AR-2025-0634'). Null if none is given."
-    )
-    is_final_position: bool = Field(
-        description="True if the report presents itself as the auditor's final/authoritative "
-        "position for covenant purposes. False if the text itself indicates this is a draft, "
-        "interim, or otherwise non-final workpaper (read any disclaimers near the top "
-        "carefully — this distinction is explicitly called out in some of these reports)."
-    )
-    reclassifications: list[AuditReclassification]
-
-
-# ---------------------------------------------------------------------------
-# 2b: Generic supporting-fact extraction (treasury memos, financial
-# statements, or any other document type not covered by the two schemas
-# above but potentially relevant to a covenant calculation).
+# 2b: Generic supporting-fact extraction (treasury memos, financial notes,
+# or any other document type not covered by the schemas below but
+# potentially relevant to a covenant calculation). Defined before
+# AuditExtractionResult, which now embeds this same OtherFact shape — see
+# that section's docstring for why one document can carry all three fact
+# shapes at once.
 # ---------------------------------------------------------------------------
 
 
@@ -237,6 +194,112 @@ class OtherFactsExtractionResult(BaseModel):
         "concept, explicit statements about classification or treatment of specific amounts). "
         "Empty list if this document has nothing covenant-relevant in it — that is a valid "
         "and expected answer for purely administrative or unrelated documents."
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2b: Auditor / financial-notes disclosure extraction.
+#
+# Confirmed on the public dataset: a borrower's own "Примечания к
+# финансовой отчётности" (Notes to Financial Statements) document — issued
+# by the same audit firm, same "ДОПОЛНЕНИЕ О СОБЛЮДЕНИИ КОВЕНАНТОВ" section
+# shape as a standalone audit_report — routinely mixes three different
+# fact shapes in one document: ordinary reclassifications (ratio/aggregate
+# category reassignment), a specific transaction's *true amount* when the
+# ledger export dropped it (a dirty-row correction, joined by txn_id, not
+# by category), and free-standing figures with no ledger transaction at all
+# (an off-ledger accrual, a settlement-implied FX rate). One extraction
+# call now covers all three rather than routing to three different
+# extractors, since a real document doesn't self-sort into single-purpose
+# files.
+# ---------------------------------------------------------------------------
+
+
+class AuditReclassification(BaseModel):
+    txn_id: Optional[str] = Field(
+        description="The specific transaction ID this finding names, if the source text "
+        "states one directly (e.g. 'Операция TXN-B4-0026'). Null if the finding only "
+        "identifies the transaction by counterparty and amount (the more common case for "
+        "standalone audit reports) — Block 3 joins on those instead."
+    )
+    counterparty_name: Optional[str] = Field(
+        description="Counterparty named in this reclassification finding, if any is stated. "
+        "Null if the finding does not name a specific counterparty."
+    )
+    amount: Optional[float] = Field(
+        description="The dollar amount cited for this reclassification, as a positive number, "
+        "if the report states one. Null if no specific amount is cited."
+    )
+    transaction_date_or_period: Optional[str] = Field(
+        description="Any date or period stated for the reclassified item (ISO date if exact, "
+        "otherwise as stated, e.g. 'Q1 2025'). Null if none stated."
+    )
+    action: Literal["recategorize", "exclude_from_period", "no_change"] = Field(
+        description="'recategorize' if the item was moved to a different category — "
+        "original_category and reclassified_category are both given. "
+        "'exclude_from_period' if the finding says this specific transaction should be "
+        "excluded entirely from the covenant period regardless of its category (e.g. "
+        "revenue/risk recognized in a different fiscal period than the transaction date "
+        "suggests — 'исключена из ковенантного периода', 'относится к периоду ...'). "
+        "'no_change' if the finding says a reclassification was considered or requested but "
+        "was explicitly REJECTED, or that no reclassification was needed — this is purely "
+        "informational and must never change any calculation."
+    )
+    original_category: Optional[str] = Field(
+        description="The category the item was originally recorded under, in the source "
+        "language. Null unless action is 'recategorize'."
+    )
+    reclassified_category: Optional[str] = Field(
+        description="The category the auditor reassigned the item to, in the source "
+        "language. Null unless action is 'recategorize'."
+    )
+    reasoning: str = Field(
+        description="The auditor's stated reason for this finding, in the source language."
+    )
+    source_quote: str = Field(description="The finding's own text, as exactly as possible.")
+
+
+class TransactionAmountCorrection(BaseModel):
+    txn_id: str = Field(
+        description="The exact transaction ID this correction applies to (e.g. "
+        "'TXN-P8-0031'), always stated directly in these findings — never inferred."
+    )
+    corrected_amount: float = Field(
+        description="The true amount for this transaction, signed exactly as the ledger "
+        "convention (negative = outflow, positive = inflow) — read the finding's own words "
+        "carefully for direction ('расход' = outflow = negative)."
+    )
+    reasoning: str = Field(
+        description="Why a correction is needed, in the source language (e.g. 'сумма не "
+        "отражена в выгрузке реестра')."
+    )
+    source_quote: str = Field(description="The finding's own text, as exactly as possible.")
+
+
+class AuditExtractionResult(BaseModel):
+    report_reference: Optional[str] = Field(
+        description="The report's own reference/engagement number, if stated (e.g. "
+        "'AR-2025-0634'). Null if none is given."
+    )
+    is_final_position: bool = Field(
+        description="True if the report presents itself as the auditor's final/authoritative "
+        "position for covenant purposes. False if the text itself indicates this is a draft, "
+        "interim, or otherwise non-final workpaper (read any disclaimers near the top "
+        "carefully — this distinction is explicitly called out in some of these reports)."
+    )
+    reclassifications: list[AuditReclassification]
+    transaction_amount_corrections: list[TransactionAmountCorrection] = Field(
+        default_factory=list,
+        description="Findings that state a specific transaction's ledger amount was dropped "
+        "or wrong, with its true value given directly (e.g. 'сумма не отражена в выгрузке "
+        "реестра; фактическая сумма операции составляет $X'). Empty list if none.",
+    )
+    other_facts: list[OtherFact] = Field(
+        default_factory=list,
+        description="Any other covenant-relevant fact in this document that isn't a "
+        "reclassification or a transaction-amount correction — an off-ledger obligation "
+        "disclosed in a note, a settlement-implied FX rate, an operational figure. Same "
+        "shape and same bar as OtherFactsExtractionResult. Empty list if none.",
     )
 
 

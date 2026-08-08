@@ -9,6 +9,7 @@ pointing this at the private dataset on Aug 9 requires no code changes.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 from covenant_agent.config import (
@@ -32,6 +33,7 @@ from covenant_agent.resolution.accounts import (
     match_known_accounts,
 )
 from covenant_agent.resolution.classify import KIND_MARKERS, classify_kind
+from covenant_agent.resolution.segment_linking import references_borrower_as_segment
 from covenant_agent.resolution.versioning import (
     detect_supersede,
     extract_dates,
@@ -96,6 +98,45 @@ def run_ingestion(data_dir: Path, cache_dir: Path) -> IngestionResult:
             continue
         for sid in target_scenarios:
             docs_by_scenario[sid].append(rdoc)
+
+    # Secondary pass: only for documents the primary ACC-token match (above)
+    # left in `unmatched` — see segment_linking.py's module docstring for
+    # why this is a separate, narrower mechanism and not a change to
+    # accounts.py itself. A linked document's kind is reassigned away from
+    # "other" (to "group_financials") purely so it survives the
+    # `!= "other"` filter below and reaches Block 2's generic fact
+    # extractor — classify.py's shared KIND_MARKERS taxonomy is untouched.
+    still_unmatched: list[ResolvedDocument] = []
+    for rdoc in unmatched:
+        linked_scenarios = set()
+        for sid in scenario_ids:
+            borrower_names = {
+                name
+                for doc in docs_by_scenario[sid]
+                if doc.metadata.kind == "credit_agreement"
+                for name in doc.metadata.company_names
+            }
+            if any(
+                references_borrower_as_segment(rdoc.parsed.text, name) for name in borrower_names
+            ):
+                linked_scenarios.add(sid)
+        if not linked_scenarios:
+            still_unmatched.append(rdoc)
+            continue
+        linked_doc = ResolvedDocument(
+            parsed=rdoc.parsed,
+            metadata=replace(rdoc.metadata, kind="group_financials", kind_score=1),
+        )
+        for sid in linked_scenarios:
+            logger.warning(
+                "Scenario %s: document %s linked via segment-reference match (not an "
+                "ACC-token match) — verify manually: %s",
+                sid,
+                rdoc.parsed.doc_id,
+                rdoc.parsed.source_path,
+            )
+            docs_by_scenario[sid].append(linked_doc)
+    unmatched = still_unmatched
 
     scenarios: dict[str, ScenarioBundle] = {}
     for sid in scenario_ids:

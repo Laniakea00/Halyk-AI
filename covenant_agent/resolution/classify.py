@@ -23,6 +23,23 @@ from __future__ import annotations
 # kind -> marker phrases (checked case-insensitively as substrings).
 # Phrases are function-describing, not company-specific, by design.
 KIND_MARKERS: dict[str, tuple[str, ...]] = {
+    # Listed first, and with two markers, so it reliably outscores
+    # credit_agreement/audit_report on documents that share vocabulary with
+    # both ("Заёмщик", "аудитор") — confirmed necessary on the public
+    # dataset: every scenario's own "Примечания к финансовой отчётности"
+    # (Notes to Financial Statements — issued by an audit firm, discussing
+    # the borrower's accounting policy, FX settlement notes, dirty-ledger
+    # corrections, off-ledger obligations) scored a tie between
+    # credit_agreement (on "Заёмщик") and audit_report (on "аудитор") once
+    # accounts.py's letter-spaced-header fix let these documents match a
+    # scenario at all — ties previously resolved to credit_agreement by
+    # dict order, silently creating a second "current" credit agreement.
+    # This is a distinct document kind, not a duplicate of either.
+    "financial_notes": (
+        "примечания к финансовой отчётности",
+        "notes to financial statements",
+        "дополнение о соблюдении ковенантов",
+    ),
     "credit_agreement": (
         "договор банковского займа",
         "loan agreement",

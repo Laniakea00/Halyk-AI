@@ -40,7 +40,17 @@ logger = logging.getLogger(__name__)
 # Kinds handled by their own dedicated extractor (2b) rather than the
 # generic fallback. Anything in current_documents under any other kind key
 # goes through extract_other_facts instead.
-_DEDICATED_KINDS = {"credit_agreement", "kyc_dossier", "audit_report"}
+#
+# financial_notes and treasury_memo route through extract_audit_facts
+# (the *same* function and schema as audit_report), not the generic
+# fallback — confirmed necessary on the public dataset: both document
+# kinds routinely carry the same three disclosure shapes a standalone
+# audit_report does (reclassifications, transaction-amount corrections,
+# off-ledger facts), in the same "ДОПОЛНЕНИЕ О СОБЛЮДЕНИИ КОВЕНАНТОВ"
+# section shape. See _AUDIT_FACT_KINDS below and schemas.py's
+# AuditExtractionResult docstring.
+_AUDIT_FACT_KINDS = ("audit_report", "financial_notes", "treasury_memo")
+_DEDICATED_KINDS = {"credit_agreement", "kyc_dossier", *_AUDIT_FACT_KINDS}
 
 STATUS_OK = "ok"
 
@@ -97,18 +107,20 @@ def extract_scenario_facts(
         )
 
     audit_reports: list[tuple[str, object]] = []
-    for doc in bundle.current_documents.get("audit_report", ()):
-        try:
-            result = extract_audit_facts(
-                scenario_id, doc.parsed.text, log_dir=log_dir, doc_id=doc.parsed.doc_id
-            )
-            audit_reports.append((doc.parsed.doc_id, result))
-        except ExtractionError:
-            logger.exception(
-                "Scenario %s: audit extraction call failed for doc %s",
-                scenario_id,
-                doc.parsed.doc_id,
-            )
+    for kind in _AUDIT_FACT_KINDS:
+        for doc in bundle.current_documents.get(kind, ()):
+            try:
+                result = extract_audit_facts(
+                    scenario_id, doc.parsed.text, log_dir=log_dir, doc_id=doc.parsed.doc_id
+                )
+                audit_reports.append((doc.parsed.doc_id, result))
+            except ExtractionError:
+                logger.exception(
+                    "Scenario %s: audit-fact extraction call failed for doc %s (kind=%s)",
+                    scenario_id,
+                    doc.parsed.doc_id,
+                    kind,
+                )
 
     other_facts: list[tuple[str, object]] = []
     for kind, docs in bundle.current_documents.items():

@@ -28,6 +28,7 @@ from covenant_agent.extraction.cache import load_scenario_facts  # noqa: E402
 from covenant_agent.extraction.pipeline import extract_all_facts, extract_scenario_facts  # noqa: E402
 from covenant_agent.ingestion.template import required_covenant_keys  # noqa: E402
 from covenant_agent.linking.pipeline import link_all_scenarios, link_scenario  # noqa: E402
+from covenant_agent.llm_client import print_usage_summary  # noqa: E402
 from covenant_agent.models import CovenantResult  # noqa: E402
 from covenant_agent.resolution.pipeline import run_ingestion  # noqa: E402
 from covenant_agent.scoring import score_submission  # noqa: E402
@@ -157,6 +158,7 @@ def main() -> int:
                     f"rel_err={s.relative_error})"
                 )
 
+    print_usage_summary()
     return 0
 
 

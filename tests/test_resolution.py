@@ -68,6 +68,30 @@ class ResolutionAgainstRealDataTest(unittest.TestCase):
         all_ids = {d.parsed.doc_id for d in p1.all_matched_documents}
         self.assertTrue(decoy_doc_ids.isdisjoint(all_ids))
 
+    def test_p5_group_parent_report_linked_via_segment_reference(self) -> None:
+        # P5's covenant 6.1 references Group-consolidated capex "по
+        # консолидированной отчётности конечной материнской компании
+        # Группы" — the actual consolidated report (Sarybel Energy Holding
+        # JSC, in English) never mentions ACC-7805, so accounts.py's
+        # primary ACC-token match can never place it. segment_linking.py's
+        # secondary pass must find it via its Note 6 "conducted through
+        # Ekibastuz Power Services JSC" segment reference instead.
+        p5 = self.result.scenarios["P5"]
+        group_docs = p5.current_documents.get("group_financials", ())
+        self.assertEqual({d.parsed.doc_id for d in group_docs}, {"a5cc1400b640"})
+
+    def test_segment_linking_does_not_false_positive_on_other_scenarios(self) -> None:
+        # The confirmed universal noise source ("Kazakhstan JSC", a
+        # fragment of every document's bank letterhead) and the Sarybel
+        # report's own name (not Group-affiliated with any *other*
+        # scenario by anything but a superficial "sounds corporate" read)
+        # must not cause a spurious link anywhere else.
+        for scenario_id, bundle in self.result.scenarios.items():
+            if scenario_id == "P5":
+                continue
+            with self.subTest(scenario_id=scenario_id):
+                self.assertNotIn("group_financials", bundle.current_documents)
+
     def test_superseded_2024_agreement_excluded_from_current(self) -> None:
         p1 = self.result.scenarios["P1"]
         current_agreement = p1.current_documents["credit_agreement"]

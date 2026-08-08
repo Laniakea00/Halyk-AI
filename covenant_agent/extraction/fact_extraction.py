@@ -1,15 +1,19 @@
-"""Block 2b: extract supporting facts (KYC, auditor reclassifications, and
-anything else covenant-relevant) from a borrower's other current documents.
+"""Block 2b: extract supporting facts (KYC, auditor/financial-notes
+disclosures, and anything else covenant-relevant) from a borrower's other
+current documents.
 
-Three narrow extractors, one per document kind we know how to interpret
-specifically (KYC dossier, audit reclassification report), plus a generic
-fallback for anything else that matched a scenario but isn't one of those
-two (treasury memos today; possibly financial statements or other kinds in
-the private dataset). All three use FACT_EXTRACTION_MODEL — wrong here means
-a missing/incomplete fact for Block 3 to notice and degrade around, not a
-silently wrong number, so the cost/accuracy tradeoff is different from
-covenant extraction (and, per llm_client.py's model-profile docstring, this
-call type stays on the mini tier even in the "final" profile).
+Three extractors: KYC dossier, audit-fact disclosures (extract_audit_facts
+— covers audit_report, financial_notes, AND treasury_memo, see
+extraction/pipeline.py's _AUDIT_FACT_KINDS: confirmed on the public
+dataset that all three document kinds mix reclassifications,
+transaction-amount corrections, and off-ledger facts in one document, so
+one extractor/schema covers all three rather than three narrower ones),
+plus a generic fallback for any other kind not recognized at all. All use
+FACT_EXTRACTION_MODEL — wrong here means a missing/incomplete fact for
+Block 3 to notice and degrade around, not a silently wrong number, so the
+cost/accuracy tradeoff is different from covenant extraction (and, per
+llm_client.py's model-profile docstring, this call type stays on the mini
+tier even in the "final" profile).
 
 None of these functions decide anything. See covenant_agent/schemas.py for
 exactly where the extraction/decision line is drawn in each schema.
@@ -60,14 +64,44 @@ when the document's own text already categorizes that entity that way.
 
 AUDIT_SYSTEM_PROMPT = f"""\
 You are a precise compliance-document reader for a bank's covenant-compliance pipeline. \
-Your job is to read an auditor's agreed-upon-procedures / transaction-reclassification report \
-and extract every reclassification finding it contains.
+Your job is to read an auditor's agreed-upon-procedures report OR a borrower's own "Notes to \
+Financial Statements" / treasury memo (auditor-prepared documents routinely mix all three kinds \
+of finding below in one document — extract everything present, not just one kind) and extract:
+
+1. RECLASSIFICATIONS — a finding that changes how a specific item counts for covenant purposes. \
+Three distinct shapes, set `action` accordingly:
+   - action="recategorize": the item was moved from one category to another. Both \
+original_category and reclassified_category must be given.
+   - action="exclude_from_period": the finding says a specific transaction should be excluded \
+entirely from the covenant period, regardless of its category (e.g. "исключена из ковенантного \
+периода", or revenue/risk stated to be recognized in a different fiscal period than the \
+transaction date suggests). Leave original_category/reclassified_category null.
+   - action="no_change": the finding says a reclassification was considered or requested but \
+was explicitly REJECTED, or that no reclassification was needed/required at all (e.g. \
+"переклассификаций не требовалось", "первоначальная классификация сохраняется"). This is purely \
+informational — extract it anyway (so nothing is silently dropped), but do not fabricate a \
+reclassified_category for it.
+   Give txn_id whenever the finding states one directly (e.g. "Операция TXN-B4-0026") — this is \
+common in Notes to Financial Statements, rarer in standalone audit reports, which usually only \
+give a counterparty and amount instead.
+
+2. TRANSACTION AMOUNT CORRECTIONS — a finding that says a *specific* transaction's true ledger \
+amount differs from (or is missing from) the ledger export, always naming a txn_id directly \
+(e.g. "сумма не отражена в выгрузке реестра; фактическая сумма операции составляет $X"). Give \
+the corrected amount signed exactly as the ledger convention (negative = outflow — read the \
+finding's own wording for direction, e.g. "(расход)" means outflow/negative).
+
+3. OTHER FACTS — any other covenant-relevant figure with no specific ledger transaction behind \
+it at all: an off-ledger obligation disclosed in a note (e.g. an accrued severance/pension \
+liability), a settlement-implied FX conversion rate, an operational figure. Same bar as: it is \
+normal and expected for a document to have none of these — do not stretch to invent relevance, \
+and do not extract routine administrative content as if it were a financial fact.
 
 {_SHARED_RULES}
-- Pay close attention to whether this specific report presents itself as the auditor's final \
+- Pay close attention to whether this specific document presents itself as the auditor's final \
 position or as a draft/interim workpaper superseded by a later final report — set \
 is_final_position accordingly based on the document's own words, not on your own guess.
-- Extract every reclassification finding, regardless of its dollar size.
+- Extract every finding of every kind above, regardless of its dollar size.
 """
 
 OTHER_SYSTEM_PROMPT = f"""\
@@ -109,7 +143,7 @@ def extract_audit_facts(
 ) -> AuditExtractionResult:
     input_text = (
         f"Borrower scenario id: {scenario_id}\n\n"
-        f"--- AUDIT RECLASSIFICATION REPORT TEXT ---\n{doc_text}\n--- END OF TEXT ---"
+        f"--- AUDIT / FINANCIAL-NOTES DOCUMENT TEXT ---\n{doc_text}\n--- END OF TEXT ---"
     )
     result, _raw = extract_structured(
         instructions=AUDIT_SYSTEM_PROMPT,

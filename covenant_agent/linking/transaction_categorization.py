@@ -77,11 +77,17 @@ usually hold positive amounts), but the description is the primary signal. The s
 applies on the positive-amount side as on the negative one: this ledger is deliberately full \
 of positive-amount transactions that are NOT revenue even though money is coming in — refunds, \
 rebates, tax credits/overpayments returned, deposits returned, lease incentives, insurance \
-payouts, marketing co-op funding received, overbilling corrections. A "revenue" category means \
-genuine sales/operating income from the borrower's core business, not any inflow. If a positive \
-transaction's description names a refund, rebate, credit, return, incentive, or reimbursement of \
-something the business already spent or already holds, that is evidence AGAINST it being \
-revenue, regardless of how large or well-timed the amount is.
+payouts, marketing co-op funding received, overbilling corrections, and advances/prepayments \
+received. A "revenue" category means genuine sales/operating income from the borrower's core \
+business, not any inflow. If a positive transaction's description names a refund, rebate, \
+credit, return, incentive, or reimbursement of something the business already spent or already \
+holds, that is evidence AGAINST it being revenue, regardless of how large or well-timed the \
+amount is. The same applies to an advance, prepayment, or deposit received against a future or \
+not-yet-completed sale ("аванс", "предоплата", "advance", "prepayment") — cash received in \
+advance of the underlying sale is not yet recognized revenue, especially when a covenant's own \
+definition of revenue is stated on an accrual/recognition basis ("выручка, признанная в этом \
+периоде") rather than a cash basis; treat such a transaction as evidence AGAINST the revenue \
+category even though money did come in.
 - Never invent a category key that wasn't given to you.
 - Never decide or imply anything about covenant compliance — you are only labeling what each \
 transaction is, not evaluating any limit.

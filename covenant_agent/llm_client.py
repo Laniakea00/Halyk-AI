@@ -141,6 +141,65 @@ TOP_TIER_TOKEN_BUDGET = 250_000  # approximate, user-stated combined cap
 _TOP_TIER_WARN_FRACTION = 0.8
 _top_tier_tokens_used = 0
 
+# Every call's usage, on every model — not just the budget-constrained
+# top tier above. Added 2026-08-08 after the top-tier-only counter gave a
+# false sense of safety: a single evening's mini-tier usage alone (~1.74M
+# tokens, confirmed by manually reconstructing cache/llm_logs after the
+# fact) was comparable to a colleague's entire week of "normal" usage, and
+# there was zero automated visibility into that total until it was
+# reconstructed by hand. "Practically unlimited" was an assumption that had
+# never actually been instrumented — this closes that gap for every model,
+# not just the one tier a hard dollar/token cap happened to be stated for.
+_tokens_used_by_model: dict[str, int] = {}
+_calls_by_model: dict[str, int] = {}
+
+
+def usage_summary() -> dict[str, dict[str, int]]:
+    """Cumulative {model: {"calls": N, "tokens": N}} for every model used
+    by this process so far. Pure data — see log_usage_summary() to print
+    it, or scripts/*.py's main() for the "print at the end of every run"
+    pattern this exists for.
+    """
+    return {
+        model: {"calls": _calls_by_model[model], "tokens": tokens}
+        for model, tokens in _tokens_used_by_model.items()
+    }
+
+
+def log_usage_summary(level: int = logging.INFO) -> None:
+    """Log a one-line-per-model breakdown plus a grand total.
+
+    Intended to be called once, unconditionally, at the end of every CLI
+    script's main() — so every run ends with an honest, automatic answer
+    to "how many tokens did that just cost", never another manual
+    cache/llm_logs reconstruction after the fact.
+    """
+    if not _tokens_used_by_model:
+        logger.log(level, "No LLM calls made this run.")
+        return
+    total_tokens = sum(_tokens_used_by_model.values())
+    total_calls = sum(_calls_by_model.values())
+    logger.log(level, "LLM usage this run: %d call(s), %d token(s) total.", total_calls, total_tokens)
+    for model, tokens in sorted(_tokens_used_by_model.items(), key=lambda kv: -kv[1]):
+        logger.log(level, "  %s: %d call(s), %d token(s)", model, _calls_by_model[model], tokens)
+
+
+def print_usage_summary() -> None:
+    """Same breakdown as log_usage_summary, but via print() — always
+    visible on stdout regardless of -v/logging level, since "what did this
+    run cost" matters even in the default (non-verbose) invocation. Called
+    unconditionally at the end of every scripts/run_*.py's main().
+    """
+    summary = usage_summary()
+    if not summary:
+        print("\nLLM usage this run: no calls made.")
+        return
+    total_tokens = sum(v["tokens"] for v in summary.values())
+    total_calls = sum(v["calls"] for v in summary.values())
+    print(f"\nLLM usage this run: {total_calls} call(s), {total_tokens} token(s) total.")
+    for model, v in sorted(summary.items(), key=lambda kv: -kv[1]["tokens"]):
+        print(f"  {model}: {v['calls']} call(s), {v['tokens']} token(s)")
+
 _client: OpenAI | None = None
 
 # The org key used to build/test this pipeline sits on a low tier (30k
@@ -288,6 +347,12 @@ def extract_structured(
     }
     if log_dir is not None:
         _log_call(log_dir, log_tag, instructions, input_text, raw)
+
+    if response.usage:
+        _tokens_used_by_model[config.model] = (
+            _tokens_used_by_model.get(config.model, 0) + response.usage.total_tokens
+        )
+        _calls_by_model[config.model] = _calls_by_model.get(config.model, 0) + 1
 
     if response.usage and _is_budget_constrained(config.model):
         global _top_tier_tokens_used

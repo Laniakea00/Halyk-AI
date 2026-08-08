@@ -196,7 +196,7 @@ def _split_compound(text: str) -> list[str]:
                 a = match.group("a").strip(" (),.")
                 b = match.group("b").strip(" ().,")
                 if a and b:
-                    split = (a, b)
+                    split = (_borrow_trailing_noun(a, b), b)
                     break
             if split:
                 next_parts.extend(split)
@@ -206,7 +206,75 @@ def _split_compound(text: str) -> list[str]:
         parts = next_parts
         if not split_any or len(parts) >= _MAX_COMPOUND_PARTS:
             break
-    return parts
+    return [_strip_defined_as_prefix(p) for p in parts]
+
+
+# Confirmed necessary on the public dataset: P10's 6.1 denominator "сумме
+# Арендных и Коммунальных расходов" (rental and utility expenses) splits
+# grammatically correctly on "и" into "Арендных" / "Коммунальных расходов"
+# — but "Арендных" ("rental", a bare adjective) is missing the noun
+# "расходов" ("expenses") that Russian grammar elides after the first of
+# two adjectives sharing one trailing noun. A category worded as a bare
+# adjective with nothing to agree with is meaningless to the transaction
+# classifier (there is no ledger line ever literally described as just
+# "rental"). Same pattern confirmed on P2's 6.1 denominator ("операционных
+# и капитальных затрат" -> "операционных" / "капитальных затрат").
+_ADJECTIVE_SUFFIX_RE = re.compile(
+    r"(?:ых|их|ого|его|ому|ему|ый|ий|ая|яя|ое|ее|ой|ей|ые|ие)$", re.IGNORECASE
+)
+
+
+def _borrow_trailing_noun(a: str, b: str) -> str:
+    """If `a` is a single bare adjective, append `b`'s trailing word (the
+    noun presumed shared/elided across both sides of the "и") to it.
+
+    Deliberately narrow: only fires when `a` is exactly one word (a phrase
+    like "Операционных расходов" already has its own noun and is left
+    alone) and that word has a Russian adjective ending. `b` must have at
+    least two words to have a noun worth borrowing at all. Doesn't attempt
+    full morphological agreement (case/gender matching) — just concatenates
+    the words, which is enough for the transaction classifier's purposes
+    (a semantically complete phrase to match against, not grammatically
+    perfect prose).
+    """
+    a_words = a.split()
+    b_words = b.split()
+    if len(a_words) != 1 or len(b_words) < 2:
+        return a
+    if not _ADJECTIVE_SUFFIX_RE.search(a_words[0]):
+        return a
+    return f"{a} {b_words[-1]}"
+
+
+# Confirmed necessary on the public dataset: P5's 6.1 denominator is "EBITDA
+# Заёмщика, рассчитываемая по его собственной отчётности как Выручка за
+# вычетом Операционных расходов" — _split_compound correctly nets this into
+# two parts on "за вычетом", but the first part retains the full "EBITDA
+# Заёмщика, рассчитываемая... как" preamble, and a category worded that way
+# found zero transaction matches on every run tested, while a plainly-worded
+# "Выручка" category elsewhere in the same scenario (6.2_amount) matched
+# fine — the preamble, not the underlying concept, appears to be what
+# confuses the classifier. EBITDA is never a literal transaction-level
+# concept (nothing in a ledger is ever labeled "EBITDA"); once a category is
+# phrased as "EBITDA ... as X", X is the actual matchable concept and the
+# EBITDA framing is redundant by that point — the split already captured
+# EBITDA as "revenue net of opex" via the two parts themselves, so nothing
+# is lost by dropping the label wording here.
+_DEFINED_AS_RE = re.compile(
+    r"^\s*(?:EBITDA|EBIT|чистая прибыль|валовая прибыль)\b.*?\bкак\s+(?P<definition>.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_defined_as_prefix(text: str) -> str:
+    """Drop a leading "EBITDA ... как <X>" framing down to just <X>.
+
+    Deliberately narrow (only fires when the part starts with a known
+    aggregate/derived-metric name and contains "как") — see the comment
+    above for why. Returns `text` unchanged if the pattern doesn't match.
+    """
+    match = _DEFINED_AS_RE.match(text)
+    return match.group("definition") if match else text
 
 
 def _make_side_specs(

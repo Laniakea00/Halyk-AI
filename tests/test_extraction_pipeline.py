@@ -62,6 +62,10 @@ def _doc(doc_id: str, text: str = "some text") -> ResolvedDocument:
 
 class ExtractScenarioFactsTest(unittest.TestCase):
     def test_full_bundle_routes_each_kind_to_its_extractor(self) -> None:
+        # audit_report AND financial_notes AND treasury_memo all route
+        # through extract_audit_facts (see extraction/pipeline.py's
+        # _AUDIT_FACT_KINDS) — "misc" stands in for a genuinely-unrecognized
+        # kind, the only thing that still goes through extract_other_facts.
         bundle = ScenarioBundle(
             scenario_id="X1",
             account_id="ACC-0001",
@@ -69,7 +73,9 @@ class ExtractScenarioFactsTest(unittest.TestCase):
                 "credit_agreement": (_doc("agreement"),),
                 "kyc_dossier": (_doc("kyc"),),
                 "audit_report": (_doc("audit"),),
+                "financial_notes": (_doc("notes"),),
                 "treasury_memo": (_doc("treasury"),),
+                "misc": (_doc("other_doc"),),
             },
         )
 
@@ -125,13 +131,14 @@ class ExtractScenarioFactsTest(unittest.TestCase):
 
         m_cov.assert_called_once()
         m_kyc.assert_called_once()
-        m_audit.assert_called_once()
-        m_other.assert_called_once()
+        self.assertEqual(m_audit.call_count, 3)  # audit_report + financial_notes + treasury_memo
+        m_other.assert_called_once()  # only the genuinely-unrecognized "misc" kind
 
         self.assertIs(facts.covenants, fake_covenants)
         self.assertIs(facts.kyc, fake_kyc)
-        self.assertEqual(facts.audit_reports, (("audit", fake_audit),))
-        self.assertEqual(facts.other_facts, (("treasury", fake_other),))
+        self.assertEqual(sorted(doc_id for doc_id, _result in facts.audit_reports), ["audit", "notes", "treasury"])
+        self.assertTrue(all(result is fake_audit for _doc_id, result in facts.audit_reports))
+        self.assertEqual(facts.other_facts, (("other_doc", fake_other),))
 
     def test_missing_kinds_degrade_to_none_and_empty_without_raising(self) -> None:
         bundle = ScenarioBundle(

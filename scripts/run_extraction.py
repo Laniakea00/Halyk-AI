@@ -25,6 +25,7 @@ from covenant_agent.config import DEFAULT_CACHE_DIR, DEFAULT_DATA_DIR  # noqa: E
 from covenant_agent.extraction.cache import load_scenario_facts, save_scenario_facts  # noqa: E402
 from covenant_agent.extraction.pipeline import extract_all_facts, extract_scenario_facts  # noqa: E402
 from covenant_agent.ingestion.template import required_covenant_keys  # noqa: E402
+from covenant_agent.llm_client import print_usage_summary  # noqa: E402
 from covenant_agent.models import ScenarioFacts  # noqa: E402
 from covenant_agent.resolution.pipeline import run_ingestion  # noqa: E402
 
@@ -133,6 +134,7 @@ def main() -> int:
                 print(f"  {sid}: {reason}")
             print("Re-run just these with: --scenario <id>")
 
+    print_usage_summary()
     return 0
 
 
