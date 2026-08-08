@@ -275,13 +275,17 @@ class LinkedReclassification:
     case — original_category/reclassified_category both set),
     "exclude_from_period" (both None; formulas.py's effective_category
     treats the transaction as excluded entirely, regardless of category),
-    or "no_change" (informational only — never actually reaches this dict,
-    see reclassification_linking.py, kept here only so the Literal is
-    shared and callers don't need a separate type).
+    "addback" (original_category set to the item's own label,
+    reclassified_category None; formulas.py's _addback_magnitude adds the
+    transaction's magnitude into whichever covenant it best matches,
+    without touching its normal effective_category), or "no_change"
+    (informational only — never actually reaches this dict, see
+    reclassification_linking.py, kept here only so the Literal is shared
+    and callers don't need a separate type).
     """
 
     txn_id: str
-    action: str  # "recategorize" | "exclude_from_period"
+    action: str  # "recategorize" | "exclude_from_period" | "addback"
     original_category: str | None
     reclassified_category: str | None
     reasoning: str

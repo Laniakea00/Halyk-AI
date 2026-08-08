@@ -29,7 +29,13 @@ from covenant_agent.models import CategorySpec
 from covenant_agent.schemas import CovenantClause, CovenantExtractionResult
 
 _RELATED_PARTY_RE = re.compile(
-    r"связанн|аффилиров|related.?part|affiliat", re.IGNORECASE
+    # H4 (red-team): "байланысты тарап"/"аффилирленген" cover the Kazakh
+    # phrasing for "related party"/"affiliated" — added defensively, not
+    # confirmed as a live gap (the public dataset's own related-party
+    # findings are all Russian/English), same reasoning as financial_notes'
+    # Kazakh markers in resolution/classify.py.
+    r"связанн|аффилиров|аффилирленген|байланысты\s+тарап|related.?part|affiliat",
+    re.IGNORECASE,
 )
 _PUNCTUATION_RE = re.compile(r"[.,;:()\"'«»]")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -59,7 +65,12 @@ def is_related_party_text(text: str | None) -> bool:
 
 
 _UNRESTRICTED_SUBSIDIARY_RE = re.compile(
-    r"неограниченн\w*\s+дочерн\w*|unrestricted\s+subsidiar\w*", re.IGNORECASE
+    # H4: "шектеусіз/шектелмеген еншілес" is the Kazakh phrasing for
+    # "unrestricted subsidiary" — added defensively, same reasoning as
+    # _RELATED_PARTY_RE above.
+    r"неограниченн\w*\s+дочерн\w*|unrestricted\s+subsidiar\w*"
+    r"|шектеусіз\s+еншілес\w*|шектелмеген\s+еншілес\w*",
+    re.IGNORECASE,
 )
 
 

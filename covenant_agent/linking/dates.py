@@ -30,6 +30,23 @@ RU_MONTHS = {
 DATE_TOLERANCE_DAYS = 14
 
 
+def _safe_date(year: int, month: int, day: int) -> date | None:
+    """date(...) construction that degrades to None on an out-of-range
+    component (e.g. month=99, day=45) instead of raising.
+
+    Confirmed necessary: this module's own docstring already promises
+    "everything here degrades... rather than raising", but a
+    pattern-shaped-yet-calendar-invalid string (OCR noise, a reference
+    number that happens to look date-shaped, e.g. "9999-99-99") broke that
+    promise for real — date() raised ValueError, uncaught, all the way up
+    through reclassification_linking.py's caller.
+    """
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
 def parse_period(text: str | None) -> tuple[date, date] | None:
     """Best-effort parse of a date/period string into an inclusive (start, end) range."""
     if not text:
@@ -37,28 +54,34 @@ def parse_period(text: str | None) -> tuple[date, date] | None:
 
     iso = _ISO_RE.search(text)
     if iso:
-        d = date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
-        return d - timedelta(days=DATE_TOLERANCE_DAYS), d + timedelta(days=DATE_TOLERANCE_DAYS)
+        d = _safe_date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        if d is not None:
+            return d - timedelta(days=DATE_TOLERANCE_DAYS), d + timedelta(days=DATE_TOLERANCE_DAYS)
 
     quarter = _QUARTER_RE.search(text)
     if quarter:
         q, year = int(quarter.group(1)), int(quarter.group(2))
-        start = date(year, (q - 1) * 3 + 1, 1)
-        return start, _next_month(start, 3) - timedelta(days=1)
+        start = _safe_date(year, (q - 1) * 3 + 1, 1)
+        if start is not None:
+            return start, _next_month(start, 3) - timedelta(days=1)
 
     year_month = _YEAR_MONTH_RE.search(text)
     if year_month:
         year, month = int(year_month.group(1)), int(year_month.group(2))
-        start = date(year, month, 1)
-        return start, _next_month(start, 1) - timedelta(days=1)
+        start = _safe_date(year, month, 1)
+        if start is not None:
+            return start, _next_month(start, 1) - timedelta(days=1)
 
     lowered = text.lower()
     for stem, month in RU_MONTHS.items():
         if stem in lowered:
             year_match = re.search(r"\b(20\d{2})\b", text)
             if year_match:
-                start = date(int(year_match.group(1)), month, 1)
-                return start, _next_month(start, 1) - timedelta(days=1)
+                start = _safe_date(int(year_match.group(1)), month, 1)
+                if start is not None:
+                    return start, _next_month(start, 1) - timedelta(days=1)
+
+    return None
 
     return None
 

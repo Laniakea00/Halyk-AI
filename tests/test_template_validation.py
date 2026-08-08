@@ -93,6 +93,20 @@ class LoadTemplateValidationTest(unittest.TestCase):
             except TemplateValidationError as exc:
                 self.assertIn("answers", str(exc))
 
+    def test_malformed_json_raises_template_validation_error_not_json_decode_error(self) -> None:
+        # Red-team finding M4: json.load() wasn't wrapped at all — a
+        # truncated/malformed submission_template.json crashed with a bare
+        # JSONDecodeError instead of this module's own, more diagnosable
+        # error type. Deliberately NOT falling back to an empty dict/{} —
+        # that would reintroduce the exact silent-zero-scenarios failure
+        # this module exists to prevent (see module docstring).
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "submission_template.json"
+            path.write_text('{"answers": {"P1": ', encoding="utf-8")  # truncated
+            with self.assertRaises(TemplateValidationError) as cm:
+                load_template(path)
+            self.assertIn("not valid JSON", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

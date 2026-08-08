@@ -69,7 +69,7 @@ Financial Statements" / treasury memo (auditor-prepared documents routinely mix 
 of finding below in one document — extract everything present, not just one kind) and extract:
 
 1. RECLASSIFICATIONS — a finding that changes how a specific item counts for covenant purposes. \
-Three distinct shapes, set `action` accordingly:
+Four distinct shapes, set `action` accordingly:
    - action="recategorize": the item was moved from one category to another. Both \
 original_category and reclassified_category must be given.
    - action="exclude_from_period": the finding says a specific transaction should be excluded \
@@ -81,6 +81,11 @@ was explicitly REJECTED, or that no reclassification was needed/required at all 
 "переклассификаций не требовалось", "первоначальная классификация сохраняется"). This is purely \
 informational — extract it anyway (so nothing is silently dropped), but do not fabricate a \
 reclassified_category for it.
+   - action="addback": the finding says a specific one-time item should be added back into an \
+adjusted metric (e.g. "Скорректированная EBITDA... с прибавлением разовых статей, признанных \
+аудиторами подлежащими обратному добавлению"). Give original_category as the item's own label \
+(what it names itself as, e.g. "Разовые расходы на реструктуризацию"); leave \
+reclassified_category null.
    Give txn_id whenever the finding states one directly (e.g. "Операция TXN-B4-0026") — this is \
 common in Notes to Financial Statements, rarer in standalone audit reports, which usually only \
 give a counterparty and amount instead.

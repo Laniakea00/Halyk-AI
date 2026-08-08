@@ -10,13 +10,20 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from covenant_agent.linking.pipeline import _apply_amount_corrections, link_all_scenarios, link_scenario
+from covenant_agent.linking.pipeline import (
+    _apply_amount_corrections,
+    _log_non_usd_transactions,
+    link_all_scenarios,
+    link_scenario,
+)
 from covenant_agent.linking.transaction_categorization import UNCLASSIFIED
 from covenant_agent.models import IngestionResult, ScenarioBundle, ScenarioFacts, Transaction
 from covenant_agent.schemas import AuditExtractionResult, TransactionAmountCorrection
 
 
-def _txn(txn_id: str, account_id: str, amount: float | None = -100.0) -> Transaction:
+def _txn(
+    txn_id: str, account_id: str, amount: float | None = -100.0, currency: str = "USD"
+) -> Transaction:
     return Transaction(
         txn_id=txn_id,
         date="2025-06-01",
@@ -25,7 +32,7 @@ def _txn(txn_id: str, account_id: str, amount: float | None = -100.0) -> Transac
         counterparty="Some Vendor",
         description="test",
         amount=amount,
-        currency="USD",
+        currency=currency,
     )
 
 
@@ -155,6 +162,25 @@ class LinkAllScenariosBatchResilienceTest(unittest.TestCase):
         self.assertEqual(status["S1"], "ok")
         self.assertTrue(status["S2"].startswith("FAILED"))
         self.assertIn("S2", linked)  # still present, degraded
+
+
+class LogNonUsdTransactionsTest(unittest.TestCase):
+    """No conversion, no silent drop — a single scenario-level summary
+    warning so a non-USD transaction's exclusion from every covenant sum
+    (formulas.py never converts, see README's FX scope note) is visible,
+    not silent.
+    """
+
+    def test_logs_a_warning_when_non_usd_transactions_present(self) -> None:
+        txns = [_txn("T1", "ACC-1", amount=-100.0, currency="EUR")]
+        with self.assertLogs("covenant_agent.linking.pipeline", level="WARNING") as cm:
+            _log_non_usd_transactions("X", txns)
+        self.assertTrue(any("T1" in msg and "EUR" in msg for msg in cm.output))
+
+    def test_no_log_when_everything_is_usd(self) -> None:
+        txns = [_txn("T1", "ACC-1", amount=-100.0, currency="USD")]
+        with self.assertNoLogs("covenant_agent.linking.pipeline", level="WARNING"):
+            _log_non_usd_transactions("X", txns)
 
 
 if __name__ == "__main__":

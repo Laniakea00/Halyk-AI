@@ -103,6 +103,32 @@ def _apply_amount_corrections(
     return patched
 
 
+def _log_non_usd_transactions(scenario_id: str, transactions: list[Transaction]) -> None:
+    """One scenario-level summary warning for every non-USD transaction —
+    calculation/formulas.py silently excludes these from every sum (no FX
+    conversion is implemented; see README's FX scope note), which is the
+    right call for 11 of 12 public-dataset scenarios that have no
+    disclosed rate at all, but "silently" is the operative risk word.
+    Logged once here, at link time, rather than from inside
+    _category_signed_sum/_related_party_sum — those run many times per
+    covenant (once per counterfactual in evidence.py), so logging there
+    would repeat the same warning dozens of times for the same
+    transaction; this is deliberately a single, scenario-level summary
+    instead. Never converts 1:1 or otherwise — exclusion is the existing,
+    intentional behavior; this only makes it visible.
+    """
+    non_usd = [t for t in transactions if t.currency != "USD"]
+    if not non_usd:
+        return
+    logger.warning(
+        "Scenario %s: %d transaction(s) in a non-USD currency will be excluded from every "
+        "covenant sum (no FX conversion implemented — see README's FX scope note): %s",
+        scenario_id,
+        len(non_usd),
+        [(t.txn_id, t.currency, t.amount) for t in non_usd],
+    )
+
+
 def _collect_other_facts(
     audit_reports: "tuple[tuple[str, AuditExtractionResult], ...]",
 ) -> tuple[OtherFact, ...]:
@@ -129,6 +155,7 @@ def link_scenario(
         len(transactions),
         account_id,
     )
+    _log_non_usd_transactions(scenario_id, transactions)
 
     if facts.covenants is not None:
         category_specs = derive_category_specs(facts.covenants)

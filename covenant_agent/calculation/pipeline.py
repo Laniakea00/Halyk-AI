@@ -70,6 +70,26 @@ def calculate_covenant(
     if linked is None:
         return _fallback(scenario_id, covenant_key, "no linked ledger data available for this scenario")
 
+    if clause.carve_outs:
+        # Idea 2 (offline audit): `carve_outs` is populated by 2a extraction
+        # for real covenants across the public dataset (confirmed on
+        # P2/P3/P4/P7/P9/P10) but has no reader anywhere in formulas.py/
+        # evidence.py — every carve-out condition (springing-test
+        # thresholds, FX conversion notes, materiality floors, KYC-based
+        # affiliate scoping...) is silently dropped on the floor at
+        # calculation time. This does not change `actual`/`status` — it
+        # only makes the drop visible, so it stops being silent. Whether to
+        # act on any given carve-out is a separate, larger decision (some
+        # of these are the already-deferred springing-covenant/FX scope).
+        logger.warning(
+            "Scenario %s covenant %s: %d carve-out condition(s) extracted but not applied in "
+            "calculation — %s",
+            scenario_id,
+            covenant_key,
+            len(clause.carve_outs),
+            clause.carve_outs,
+        )
+
     try:
         result = find_evidence(clause, linked)
     except InsufficientDataError as exc:

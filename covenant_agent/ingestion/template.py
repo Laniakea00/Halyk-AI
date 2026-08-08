@@ -35,7 +35,21 @@ class TemplateValidationError(RuntimeError):
 
 def load_template(template_path: Path) -> dict:
     with template_path.open(encoding="utf-8") as f:
-        data = json.load(f)
+        raw_text = f.read()
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        # Deliberately NOT a fallback-to-{} here — that would reintroduce
+        # exactly the failure mode this module exists to prevent (see
+        # module docstring): required_scenario_ids() silently returning
+        # [] and the whole pipeline quietly processing zero scenarios.
+        # Malformed JSON gets the same loud, immediate, precisely-located
+        # failure as a malformed *structure* does — just with a clearer
+        # message than the bare traceback json.JSONDecodeError gives on
+        # its own (line/column instead of a byte offset buried in repr).
+        raise TemplateValidationError(
+            f"{template_path}: not valid JSON (line {exc.lineno}, column {exc.colno}): {exc.msg}"
+        ) from exc
     _validate_template_structure(data, template_path)
     return data
 

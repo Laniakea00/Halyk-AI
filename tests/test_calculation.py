@@ -32,14 +32,16 @@ from covenant_agent.models import (
 from covenant_agent.schemas import CovenantClause, OtherFact
 
 
-def _txn(txn_id, amount, counterparty="Some Vendor", date="2025-06-01", currency="USD") -> Transaction:
+def _txn(
+    txn_id, amount, counterparty="Some Vendor", date="2025-06-01", currency="USD", description="test transaction"
+) -> Transaction:
     return Transaction(
         txn_id=txn_id,
         date=date,
         account_id="ACC-0001",
         scenario_id="X1",
         counterparty=counterparty,
-        description="test transaction",
+        description=description,
         amount=amount,
         currency=currency,
     )
@@ -515,6 +517,419 @@ class MaxSingleComponentOtherFactsTest(unittest.TestCase):
         clause = _clause(covenant_key="6.2", metric_type="max_single_component")
         actual = compute_metric(clause, linked)  # must not raise
         self.assertAlmostEqual(actual, 1000.0)
+
+
+class CapexRollForwardDerivationTest(unittest.TestCase):
+    """P5 6.1's numerator ("совокупные капитальные затраты Группы") has no
+    ledger transactions and no directly-stated capex figure anywhere in its
+    Group-parent financial notes — only a PP&E roll-forward note (opening
+    NBV, the year's depreciation charge, closing NBV). Real wording and
+    real values taken from the actual P5 audit-fact extraction log.
+    """
+
+    NUM_SPEC = CategorySpec(
+        key="6.1_numerator",
+        covenant_key="6.1",
+        role="numerator",
+        description=(
+            "совокупные капитальные затраты Группы (по консолидированной отчётности "
+            "конечной материнской компании Группы, включая затраты всех участников Группы)"
+        ),
+    )
+    DEN_SPEC = CategorySpec(key="6.1_denominator", covenant_key="6.1", role="denominator", description="EBITDA")
+    # aggregate_amount's own _resolve_side_sum call always uses role="amount"
+    # (see compute_metric's aggregate_amount/other branch) — a distinct spec
+    # from NUM_SPEC (role="numerator"), used only by the aggregate_amount
+    # tests below.
+    AMOUNT_SPEC = CategorySpec(key="6.1_amount", covenant_key="6.1", role="amount", description=NUM_SPEC.description)
+
+    def test_derives_capex_from_nbv_roll_forward_when_no_ready_figure(self) -> None:
+        facts = [
+            _fact("Net book value at the beginning of the year", 148028989.69),
+            _fact("Depreciation charge for the year", 15826229.43),
+            _fact("Net book value at the end of the year", 154050122.81),
+        ]
+        txns = [_txn("EBITDA", 1000.0)]
+        linked = _linked(
+            txns,
+            category_specs=[self.NUM_SPEC, self.DEN_SPEC],
+            txn_category={"EBITDA": "6.1_denominator"},
+            other_facts=facts,
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            numerator_description=self.NUM_SPEC.description,
+            denominator_description="EBITDA",
+        )
+        actual = compute_metric(clause, linked)  # must not raise InsufficientDataError
+        self.assertAlmostEqual(actual, 21847362.55 / 1000.0, places=2)
+
+    def test_partial_roll_forward_is_not_derived(self) -> None:
+        # Depreciation charge is missing — must not guess at two-thirds of
+        # a roll-forward, so the numerator stays empty (InsufficientDataError).
+        facts = [
+            _fact("Net book value at the beginning of the year", 148028989.69),
+            _fact("Net book value at the end of the year", 154050122.81),
+        ]
+        txns = [_txn("EBITDA", 1000.0)]
+        linked = _linked(
+            txns,
+            category_specs=[self.NUM_SPEC, self.DEN_SPEC],
+            txn_category={"EBITDA": "6.1_denominator"},
+            other_facts=facts,
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            numerator_description=self.NUM_SPEC.description,
+            denominator_description="EBITDA",
+        )
+        # Ratio numerators are not data-checked (only denominators are, per
+        # compute_metric) — assert the derivation didn't fire by checking
+        # the numerator side directly via aggregate_amount instead.
+        agg_clause = _clause(
+            covenant_key="6.1",
+            metric_type="aggregate_amount",
+            numerator_description=None,
+            denominator_description=None,
+            formula_description=self.AMOUNT_SPEC.description,
+        )
+        agg_linked = _linked(
+            [], category_specs=[self.AMOUNT_SPEC], other_facts=facts
+        )
+        with self.assertRaises(InsufficientDataError):
+            compute_metric(agg_clause, agg_linked)
+        # Sanity: the ratio call itself still runs (denominator has data).
+        compute_metric(clause, linked)
+
+    def test_ready_capex_figure_takes_precedence_over_derivation(self) -> None:
+        # A direct disclosure must win outright — not be added on top of a
+        # derived figure computed from the same underlying roll-forward.
+        facts = [
+            _fact("Net book value at the beginning of the year", 148028989.69),
+            _fact("Depreciation charge for the year", 15826229.43),
+            _fact("Net book value at the end of the year", 154050122.81),
+            _fact("Капитальные затраты Группы за период", 9000000.0),
+        ]
+        linked = _linked(
+            [],
+            category_specs=[self.AMOUNT_SPEC],
+            other_facts=facts,
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            metric_type="aggregate_amount",
+            numerator_description=None,
+            denominator_description=None,
+            formula_description=self.AMOUNT_SPEC.description,
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 9000000.0)
+
+
+class SiblingCategoryBorrowTest(unittest.TestCase):
+    """Confirmed necessary on the public dataset: P5's covenant 6.1
+    denominator ("Выручка") and covenant 6.2 ("совокупный объём
+    поступлений по статье «Выручка»...") describe the same real-world
+    revenue transactions — the categorizer assigns each transaction to
+    exactly one category, so 6.2's fuller wording can "win" every real
+    revenue transaction, leaving 6.1's own category with zero matches even
+    though the answer sits right there under 6.2. This tests the
+    code-level (no LLM) borrow that recovers it.
+    """
+
+    def test_borrows_sibling_covenants_transactions_when_own_category_is_empty(self) -> None:
+        den_61 = CategorySpec(key="6.1_denominator", covenant_key="6.1", role="denominator", description="Выручка")
+        amount_62 = CategorySpec(
+            key="6.2_amount",
+            covenant_key="6.2",
+            role="amount",
+            description="совокупный объём поступлений по статье «Выручка», понимаемых как суммы, отнесённые к данной статье",
+        )
+        txns = [_txn("NUMTXN", 2000.0), _txn("REV", 1000.0)]
+        linked = _linked(
+            txns,
+            category_specs=[NUM_SPEC, den_61, amount_62],
+            txn_category={"NUMTXN": "6.1_numerator", "REV": "6.2_amount"},  # classifier picked 6.2, not 6.1
+        )
+        clause = _clause(
+            covenant_key="6.1", numerator_description="revenue", denominator_description="Выручка"
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 2.0)  # 2000 / 1000(borrowed) — not InsufficientDataError
+
+    def test_does_not_borrow_when_own_category_already_has_data(self) -> None:
+        # No override/double-count: if 6.1's own denominator already found
+        # something, the sibling must never be consulted at all.
+        den_61 = CategorySpec(key="6.1_denominator", covenant_key="6.1", role="denominator", description="Выручка")
+        amount_62 = CategorySpec(
+            key="6.2_amount",
+            covenant_key="6.2",
+            role="amount",
+            description="совокупный объём поступлений по статье «Выручка»",
+        )
+        txns = [_txn("NUMTXN", 1000.0), _txn("OWN", 500.0), _txn("SIBLING", 9999.0)]
+        linked = _linked(
+            txns,
+            category_specs=[NUM_SPEC, den_61, amount_62],
+            txn_category={"NUMTXN": "6.1_numerator", "OWN": "6.1_denominator", "SIBLING": "6.2_amount"},
+        )
+        clause = _clause(
+            covenant_key="6.1", numerator_description="revenue", denominator_description="Выручка"
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 2.0)  # 1000 / 500 — sibling's 9999 never touched
+
+    def test_does_not_borrow_from_a_different_role_of_the_same_covenant(self) -> None:
+        # The denominator ("Операционные расходы") has zero matches; the
+        # only other category in scope is the *numerator's own* spec
+        # (same covenant, different role) — it must not be treated as a
+        # valid donor even though it's the only thing around, so this must
+        # still raise InsufficientDataError rather than silently borrowing
+        # across roles within the same covenant.
+        num_61 = CategorySpec(key="6.1_numerator", covenant_key="6.1", role="numerator", description="revenue")
+        den_61 = CategorySpec(key="6.1_denominator", covenant_key="6.1", role="denominator", description="Операционные расходы")
+        txns = [_txn("REV", 1000.0)]
+        linked = _linked(
+            txns,
+            category_specs=[num_61, den_61],
+            txn_category={"REV": "6.1_numerator"},  # only the numerator's own category has any data
+        )
+        clause = _clause(
+            covenant_key="6.1", numerator_description="revenue", denominator_description="Операционные расходы"
+        )
+        with self.assertRaises(InsufficientDataError):
+            compute_metric(clause, linked)  # denominator empty; numerator is not a valid donor
+
+    def test_no_matching_sibling_still_raises_insufficient_data(self) -> None:
+        den_61 = CategorySpec(key="6.1_denominator", covenant_key="6.1", role="denominator", description="Выручка")
+        unrelated_62 = CategorySpec(
+            key="6.2_amount", covenant_key="6.2", role="amount", description="Капитальные затраты на оборудование"
+        )
+        txns = [_txn("CAPEX", -500.0)]
+        linked = _linked(
+            txns,
+            category_specs=[NUM_SPEC, den_61, unrelated_62],
+            txn_category={"CAPEX": "6.2_amount"},
+        )
+        clause = _clause(
+            covenant_key="6.1", numerator_description="revenue", denominator_description="Выручка"
+        )
+        with self.assertRaises(InsufficientDataError):
+            compute_metric(clause, linked)
+
+    def test_max_single_component_borrows_per_component(self) -> None:
+        comp0 = CategorySpec(key="6.1_component_0", covenant_key="6.1", role="component", description="Расходы на оплату труда")
+        sibling = CategorySpec(
+            key="6.2_amount", covenant_key="6.2", role="amount", description="совокупные расходы на оплату труда персонала"
+        )
+        txns = [_txn("PAY", -750.0)]
+        linked = _linked(
+            txns,
+            category_specs=[comp0, sibling],
+            txn_category={"PAY": "6.2_amount"},
+        )
+        clause = _clause(covenant_key="6.1", metric_type="max_single_component")
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 750.0)
+
+
+class RevenueRescueTest(unittest.TestCase):
+    """Idea 1 (offline audit): deterministic rescue for P8 6.3's confirmed
+    failure shape — a real revenue transaction the LLM categorizer misses
+    non-deterministically. Transaction wording below is taken directly from
+    the real public-dataset P8 ledger (descriptions, not amounts scaled for
+    readability), to validate the filter against the real decoy shapes it
+    has to survive, not synthetic ones.
+    """
+
+    DEN_SPEC = CategorySpec(key="6.1_denominator", covenant_key="6.1", role="denominator", description="Выручка")
+
+    def test_rescues_the_unique_clean_candidate_among_real_decoys(self) -> None:
+        txns = [
+            _txn("NUM", 2000.0, description="numerator transaction"),
+            _txn(
+                "P8-0015",
+                7884663.19,
+                counterparty="KazMunayGas Exploration JSC",
+                description="Drilling services sales settlement 2025",
+            ),
+            _txn("P8-0038", 3505589.65, description="Rent deposit returned — Astana branch, January 2025"),
+            _txn("P8-0023", 1670416.50, description="VAT refund received — December"),
+            _txn("P8-0020", 1885336.06, description="Interest income on term deposit — Shymkent depot 2025"),
+            _txn("P8-0013", 3031930.94, description="Marketing overbilling refund — period 04"),
+        ]
+        linked = _linked(
+            txns,
+            category_specs=[NUM_SPEC, self.DEN_SPEC],
+            txn_category={"NUM": "6.1_numerator"},  # everything else is unclassified
+        )
+        clause = _clause(covenant_key="6.1", numerator_description="revenue", denominator_description="Выручка")
+        actual = compute_metric(clause, linked)  # must not raise
+        self.assertAlmostEqual(actual, 2000.0 / 7884663.19)
+
+    def test_does_not_rescue_when_two_candidates_are_ambiguous(self) -> None:
+        txns = [
+            _txn("NUM", 2000.0, description="numerator transaction"),
+            _txn("A", 500.0, description="Equipment sales settlement"),
+            _txn("B", 600.0, description="Product sales settlement"),
+        ]
+        linked = _linked(txns, category_specs=[NUM_SPEC, self.DEN_SPEC], txn_category={"NUM": "6.1_numerator"})
+        clause = _clause(covenant_key="6.1", numerator_description="revenue", denominator_description="Выручка")
+        with self.assertRaises(InsufficientDataError):
+            compute_metric(clause, linked)
+
+    def test_does_not_rescue_when_every_candidate_is_a_decoy(self) -> None:
+        txns = [
+            _txn("NUM", 2000.0, description="numerator transaction"),
+            _txn("A", 500.0, description="Marketing overbilling refund"),
+            _txn("B", 600.0, description="Insurance broker rebate"),
+        ]
+        linked = _linked(txns, category_specs=[NUM_SPEC, self.DEN_SPEC], txn_category={"NUM": "6.1_numerator"})
+        clause = _clause(covenant_key="6.1", numerator_description="revenue", denominator_description="Выручка")
+        with self.assertRaises(InsufficientDataError):
+            compute_metric(clause, linked)
+
+    def test_does_not_poach_a_transaction_already_classified_elsewhere(self) -> None:
+        other_spec = CategorySpec(key="6.2_amount", covenant_key="6.2", role="amount", description="Прочие доходы")
+        txns = [
+            _txn("NUM", 2000.0, description="numerator transaction"),
+            _txn("P8-0015", 7884663.19, description="Drilling services sales settlement 2025"),
+        ]
+        linked = _linked(
+            txns,
+            category_specs=[NUM_SPEC, self.DEN_SPEC, other_spec],
+            txn_category={"NUM": "6.1_numerator", "P8-0015": "6.2_amount"},  # already confidently classified
+        )
+        clause = _clause(covenant_key="6.1", numerator_description="revenue", denominator_description="Выручка")
+        with self.assertRaises(InsufficientDataError):
+            compute_metric(clause, linked)
+
+    def test_does_not_fire_for_a_non_revenue_role(self) -> None:
+        opex_spec = CategorySpec(
+            key="6.1_denominator", covenant_key="6.1", role="denominator", description="Операционные расходы"
+        )
+        txns = [
+            _txn("NUM", 2000.0, description="numerator transaction"),
+            _txn("P8-0015", 7884663.19, description="Drilling services sales settlement 2025"),
+        ]
+        linked = _linked(txns, category_specs=[NUM_SPEC, opex_spec], txn_category={"NUM": "6.1_numerator"})
+        clause = _clause(
+            covenant_key="6.1", numerator_description="revenue", denominator_description="Операционные расходы"
+        )
+        with self.assertRaises(InsufficientDataError):
+            compute_metric(clause, linked)
+
+
+class AddbackReclassificationTest(unittest.TestCase):
+    """Idea 3 (offline audit): action="addback" — P4 6.1's "Скорректированная
+    EBITDA" pattern (revenue minus opex, plus one-time items the auditors
+    approve adding back). Unvalidated against a live extraction (no cached
+    document has ever populated this field, since it didn't exist in the
+    schema before) — synthetic tests only, per the plan agreed before
+    implementation.
+    """
+
+    OPEX_SPEC = CategorySpec(
+        key="6.1_denominator",
+        covenant_key="6.1",
+        role="denominator",
+        description="Операционные расходы, включая реструктуризацию бизнес процессов",
+    )
+
+    @staticmethod
+    def _addback(txn_id, original_category) -> LinkedReclassification:
+        return LinkedReclassification(
+            txn_id=txn_id,
+            action="addback",
+            original_category=original_category,
+            reclassified_category=None,
+            reasoning="one-time item, auditor-approved addback",
+            source_doc_id="doc1",
+            match_confidence=1.0,
+            was_ambiguous=False,
+        )
+
+    def test_addback_cancels_a_one_time_cost_already_in_the_expense_sum(self) -> None:
+        txns = [
+            _txn("NUM", 1000.0, description="revenue"),
+            _txn("ONEOFF", -500.0, description="Restructuring cost"),
+            _txn("NORMAL", -300.0, description="normal opex"),
+        ]
+        linked = _linked(
+            txns,
+            category_specs=[NUM_SPEC, self.OPEX_SPEC],
+            txn_category={"NUM": "6.1_numerator", "ONEOFF": "6.1_denominator", "NORMAL": "6.1_denominator"},
+            reclassifications={"ONEOFF": self._addback("ONEOFF", "Реструктуризация бизнес процессов")},
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            numerator_description="revenue",
+            denominator_description=self.OPEX_SPEC.description,
+        )
+        actual = compute_metric(clause, linked)
+        # -500 (oneoff) + -300 (normal) + 500 (addback cancels oneoff) = -300 -> abs 300.
+        self.assertAlmostEqual(actual, 1000.0 / 300.0)
+
+    def test_without_the_addback_the_one_time_cost_would_count_normally(self) -> None:
+        # Same ledger, no reclassification linked — sanity check that the
+        # *previous* test's difference really is the addback's doing.
+        txns = [
+            _txn("NUM", 1000.0, description="revenue"),
+            _txn("ONEOFF", -500.0, description="Restructuring cost"),
+            _txn("NORMAL", -300.0, description="normal opex"),
+        ]
+        linked = _linked(
+            txns,
+            category_specs=[NUM_SPEC, self.OPEX_SPEC],
+            txn_category={"NUM": "6.1_numerator", "ONEOFF": "6.1_denominator", "NORMAL": "6.1_denominator"},
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            numerator_description="revenue",
+            denominator_description=self.OPEX_SPEC.description,
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 1000.0 / 800.0)
+
+    def test_unmatched_addback_label_does_not_contribute(self) -> None:
+        txns = [
+            _txn("NUM", 1000.0, description="revenue"),
+            _txn("ONEOFF", -500.0, description="Restructuring cost"),
+        ]
+        linked = _linked(
+            txns,
+            category_specs=[NUM_SPEC, self.OPEX_SPEC],
+            txn_category={"NUM": "6.1_numerator", "ONEOFF": "6.1_denominator"},
+            reclassifications={"ONEOFF": self._addback("ONEOFF", "Совершенно не связанная формулировка")},
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            numerator_description="revenue",
+            denominator_description=self.OPEX_SPEC.description,
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 1000.0 / 500.0)  # addback never matched, cost counts normally
+
+    def test_reverted_addback_is_not_applied(self) -> None:
+        # revert_txn_id simulates "what if this auditor finding didn't
+        # happen" — same counterfactual mechanism exclude_from_period uses.
+        txns = [
+            _txn("NUM", 1000.0, description="revenue"),
+            _txn("ONEOFF", -500.0, description="Restructuring cost"),
+        ]
+        linked = _linked(
+            txns,
+            category_specs=[NUM_SPEC, self.OPEX_SPEC],
+            txn_category={"NUM": "6.1_numerator", "ONEOFF": "6.1_denominator"},
+            reclassifications={"ONEOFF": self._addback("ONEOFF", "Реструктуризация бизнес процессов")},
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            numerator_description="revenue",
+            denominator_description=self.OPEX_SPEC.description,
+        )
+        actual = compute_metric(clause, linked, revert_txn_id="ONEOFF")
+        self.assertAlmostEqual(actual, 1000.0 / 500.0)  # addback reverted, cost counts normally
 
 
 class ExcludeFromPeriodReclassificationTest(unittest.TestCase):

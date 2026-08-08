@@ -25,6 +25,52 @@ logger = logging.getLogger(__name__)
 TXN_ID_RE = re.compile(r"^TXN-(?P<scenario>[A-Za-z0-9]+)-(?P<seq>\d+)$")
 
 
+_THOUSANDS_GROUP_RE = re.compile(r"^-?\d{1,3}(,\d{3})+$")
+
+
+def _normalize_amount_string(raw: str, txn_id: str) -> str:
+    """Best-effort thousands/decimal-separator cleanup before float() ever
+    sees the string.
+
+    Confirmed necessary as a defensive measure, not observed as a live bug:
+    plain float() cannot parse a comma at all, so a private-dataset ledger
+    using thousands-separated numbers (e.g. "1,435,608.42" — a very common
+    CSV export convention) would otherwise degrade *every* amount to None,
+    not just genuinely malformed ones — a dataset-wide failure that would
+    look like "the classifier found nothing" everywhere rather than what
+    it actually is. The public dataset's own numbers never use a separator
+    at all ("-1435608.42"), so this must never change an already-plain
+    number — the three branches below are mutually exclusive and only
+    activate when a comma is actually present.
+    """
+    if "," not in raw:
+        return raw
+    if "." in raw:
+        # Both present: comma=thousands, period=decimal (US convention) —
+        # the only shape this case's own materials ever use when a
+        # separator appears at all.
+        normalized = raw.replace(",", "")
+    elif _THOUSANDS_GROUP_RE.match(raw):
+        # Comma-only, but shaped like proper 3-digit grouping
+        # ("1,435,608") — a whole number with thousands separators, no
+        # decimal part.
+        normalized = raw.replace(",", "")
+    else:
+        # A single comma not shaped like thousands-grouping — most likely
+        # a European decimal comma ("1435608,42").
+        normalized = raw.replace(",", ".")
+    if normalized != raw:
+        logger.warning(
+            "Ledger row %s: amount %r normalized to %r (thousands/decimal separator "
+            "cleanup) before parsing — verify this matches the dataset's real number "
+            "format if this looks wrong.",
+            txn_id,
+            raw,
+            normalized,
+        )
+    return normalized
+
+
 def _parse_amount(raw: str, txn_id: str) -> float | None:
     raw = raw.strip()
     if not raw:
@@ -36,8 +82,9 @@ def _parse_amount(raw: str, txn_id: str) -> float | None:
             txn_id,
         )
         return None
+    normalized = _normalize_amount_string(raw, txn_id)
     try:
-        return float(raw)
+        return float(normalized)
     except ValueError:
         logger.warning("Ledger row %s has an unparseable amount %r — keeping as None.", txn_id, raw)
         return None
@@ -45,7 +92,13 @@ def _parse_amount(raw: str, txn_id: str) -> float | None:
 
 def load_ledger(ledger_path: Path) -> list[Transaction]:
     transactions: list[Transaction] = []
-    with ledger_path.open(encoding="utf-8", newline="") as f:
+    # errors="replace": a single non-UTF-8 byte anywhere in the file (e.g.
+    # CP1251-encoded Cyrillic, or a stray BOM from a different export tool)
+    # must not crash the single most foundational data load in the whole
+    # pipeline — documents.py's TEXT_EXTENSIONS path already had this same
+    # safety net; the ledger load didn't, confirmed as an inconsistency,
+    # not an intentional stricter check.
+    with ledger_path.open(encoding="utf-8", errors="replace", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             txn_id = row["txn_id"].strip()

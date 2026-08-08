@@ -22,6 +22,7 @@ from covenant_agent.linking.categories import (
     is_unrestricted_subsidiary_text,
     match_category_by_text,
 )
+from covenant_agent.linking.transaction_categorization import UNCLASSIFIED
 from covenant_agent.models import CategorySpec, LinkedScenarioData, Transaction
 from covenant_agent.schemas import CovenantClause, OtherFact
 
@@ -370,13 +371,217 @@ def _resolve_side_sum(
         net += spec_total
         count += spec_count
 
+    if count == 0:
+        borrowed_total, borrowed_count = _borrow_sibling_category_sum(
+            role_specs,
+            description_text,
+            linked,
+            clause,
+            excluded_txn_id=excluded_txn_id,
+            revert_txn_id=revert_txn_id,
+            log_context=f"covenant {clause.covenant_key} {role}",
+        )
+        net += borrowed_total
+        count += borrowed_count
+
+    if count == 0:
+        rescued_total, rescued_count = _rescue_unclassified_revenue_transaction(
+            description_text,
+            linked,
+            clause,
+            excluded_txn_id=excluded_txn_id,
+            revert_txn_id=revert_txn_id,
+            log_context=f"covenant {clause.covenant_key} {role}",
+        )
+        net += rescued_total
+        count += rescued_count
+
+    # Addback is folded into `net` *before* abs(), not added to the
+    # abs()'d magnitude the way other_facts is — see _addback_magnitude's
+    # docstring. The flagged transaction is already counted once by the
+    # per-spec loop above (with its real ledger sign, e.g. -500 for a
+    # one-time cost); adding +abs(that same amount) here cancels it back
+    # to a zero net contribution, which is what "adjusted" means. Adding
+    # it after abs() would double the value instead of removing it.
+    addback_delta, addback_count = _addback_magnitude(
+        role_specs,
+        linked.category_specs,
+        linked,
+        excluded_txn_id=excluded_txn_id,
+        revert_txn_id=revert_txn_id,
+        log_context=f"covenant {clause.covenant_key} {role}",
+    )
+    net += addback_delta
+    count += addback_count
+
     fact_magnitude, fact_count = _other_facts_magnitude(
         role_specs,
         linked.category_specs,
-        linked.other_facts,
+        _effective_other_facts(linked),
         log_context=f"covenant {clause.covenant_key} {role}",
     )
     return abs(net) + fact_magnitude, count + fact_count
+
+
+def _borrow_sibling_category_sum(
+    role_specs: list[CategorySpec],
+    description_text: str | None,
+    linked: LinkedScenarioData,
+    clause: CovenantClause,
+    *,
+    excluded_txn_id: str | None,
+    revert_txn_id: str | None,
+    log_context: str,
+) -> tuple[float, int]:
+    """When `role_specs` (this covenant/role's own categories) found zero
+    matching transactions, look scenario-wide for a *different* covenant's
+    category describing the same real-world concept and, if one clears
+    the match threshold, borrow its already-categorized transactions
+    instead of surfacing InsufficientDataError.
+
+    Confirmed necessary on the public dataset: P5's covenant 6.1
+    denominator ("Выручка", net of opex) and P5's covenant 6.2 amount (a
+    fuller-worded standalone revenue test) describe the exact same
+    real-world revenue transactions for the same borrower — the
+    transaction classifier assigns each transaction to exactly one
+    category key (see transaction_categorization.py's "classify into
+    exactly one category" instruction), so when two categories from
+    different covenants genuinely describe the same concept, whichever is
+    worded more fully/specifically tends to "win" the classification,
+    leaving the other with zero matches even though the true answer sits
+    right there under a sibling covenant's category.
+
+    Deliberately a code-level, calculation-layer rule — never a second LLM
+    call, never a change to the categorization schema/prompt (no new
+    context-window cost, no change to what gets prompt-cached). Only ever
+    activates when the primary path found *nothing at all* (`count == 0`
+    in the caller), so it can never override or double-count against a
+    real, already-successful match — this is the same "try a clearer rule
+    before giving up" step InsufficientDataError's fallback used to skip
+    straight past. Every borrow is logged at WARNING, clearly marked as a
+    degraded match, not a confident primary one.
+    """
+    if not description_text:
+        return 0.0, 0
+    # Restricted to a genuinely *different* covenant — never another role
+    # of the same covenant (numerator borrowing the denominator's
+    # transactions, or vice versa, would rarely if ever be semantically
+    # correct even if the text happened to stem-overlap).
+    sibling_pool = [s for s in linked.category_specs if s.covenant_key != clause.covenant_key]
+    match = match_category_by_text(description_text, sibling_pool)
+    if match is None:
+        return 0.0, 0
+    sibling_spec, score = match
+    sibling_covenant_specs = [s for s in linked.category_specs if s.covenant_key == sibling_spec.covenant_key]
+    total, count = _category_signed_sum(
+        sibling_spec.key,
+        linked,
+        sibling_covenant_specs,
+        clause,
+        excluded_txn_id=excluded_txn_id,
+        revert_txn_id=revert_txn_id,
+    )
+    if count > 0:
+        logger.warning(
+            "%s: own category found zero transactions — borrowed sibling covenant %s's "
+            "category %r (match score %.2f) instead, which found %d transaction(s) for "
+            "the same period. Degraded, code-level fallback — not a confident primary "
+            "match; verify this borrow is semantically correct if this cell looks wrong.",
+            log_context,
+            sibling_spec.covenant_key,
+            sibling_spec.key,
+            score,
+            count,
+        )
+    return total, count
+
+
+# Idea 1 (offline audit): a deterministic, last-resort rescue for the exact
+# non-determinism shape confirmed on P8 6.3 — a genuinely revenue-shaped
+# role whose own category AND every sibling covenant's category matched
+# zero transactions, purely because transaction_categorization.py's LLM
+# call missed the one real revenue transaction on a given pass (confirmed
+# via cache/step2/run1-5's identical-input reruns: 0/5 classified
+# TXN-P8-0015 as revenue, vs 8/10 on other historical runs — genuine model
+# non-determinism, not a linking bug).
+_REVENUE_ROLE_RE = re.compile(r"выручк\w*|revenue|доход\w*\s+от\s+реализац\w*|табыс", re.IGNORECASE)
+_REVENUE_SIGNAL_RE = re.compile(r"\bsales?\b|продаж\w*|реализац\w*|settlement", re.IGNORECASE)
+_REVENUE_DECOY_RE = re.compile(
+    r"refund|rebate|\breturn\w*|recovery|credit\s+note|advance|prepay\w*"
+    r"|возврат\w*|рекредит\w*|аванс\w*|предоплат\w*|скидк\w*",
+    re.IGNORECASE,
+)
+
+
+def is_revenue_text(text: str | None) -> bool:
+    if not text:
+        return False
+    return bool(_REVENUE_ROLE_RE.search(text))
+
+
+def _rescue_unclassified_revenue_transaction(
+    description_text: str | None,
+    linked: LinkedScenarioData,
+    clause: CovenantClause,
+    *,
+    excluded_txn_id: str | None,
+    revert_txn_id: str | None,
+    log_context: str,
+) -> tuple[float, int]:
+    """Last-resort rescue: when a revenue-shaped role has zero matches from
+    both its own category and sibling-borrow, scan currently-unclassified
+    transactions for exactly one that (a) has a positive USD amount, (b)
+    names a sale/settlement concept, (c) carries none of the known decoy
+    keywords (refund/rebate/return/recovery/advance — the same taxonomy
+    transaction_categorization.py's own system prompt already documents as
+    "positive but not revenue"). Never poaches a transaction that already
+    has a confident category from *any* covenant.
+
+    Deliberately requires *exactly one* clean candidate — 0 or 2+ means the
+    signal is ambiguous, so this returns nothing and lets
+    InsufficientDataError surface rather than guessing. Validated against
+    the real public dataset: among P8's 55 real ledger transactions, this
+    filter uniquely isolates TXN-P8-0015 ("Drilling services sales
+    settlement", KazMunayGas Exploration JSC) with no other candidate.
+    """
+    if not is_revenue_text(description_text):
+        return 0.0, 0
+
+    candidates = []
+    for txn in linked.transactions:
+        if txn.txn_id == excluded_txn_id:
+            continue
+        if txn.amount is None or txn.amount <= 0 or txn.currency != "USD":
+            continue
+        if not in_period(txn, clause):
+            continue
+        reclass = linked.reclassifications.get(txn.txn_id)
+        if reclass is not None and txn.txn_id != revert_txn_id:
+            continue  # already has an auditor finding attached — not this rescue's business
+        if linked.txn_category.get(txn.txn_id, UNCLASSIFIED) != UNCLASSIFIED:
+            continue
+        if _REVENUE_DECOY_RE.search(txn.description):
+            continue
+        if not _REVENUE_SIGNAL_RE.search(txn.description):
+            continue
+        candidates.append(txn)
+
+    if len(candidates) != 1:
+        return 0.0, 0
+
+    txn = candidates[0]
+    logger.warning(
+        "%s: own category and sibling-borrow both matched zero transactions for a "
+        "revenue-shaped role — deterministic rescue found exactly one unclassified "
+        "transaction by keyword signal: %s (%.2f %s, %r). Last-resort, code-only "
+        "heuristic, not an LLM re-classification — verify this cell if it looks wrong.",
+        log_context,
+        txn.txn_id,
+        txn.amount,
+        txn.currency,
+        txn.description,
+    )
+    return txn.amount, 1
 
 
 def _other_facts_magnitude(
@@ -423,6 +628,163 @@ def _other_facts_magnitude(
                 "covenants/roles.",
                 log_context,
                 fact.fact_description,
+                best[0].key,
+            )
+    return magnitude, count
+
+
+_NBV_START_RE = re.compile(
+    r"(net\s+book\s+value|балансов\w*\s+стоимост\w*).{0,40}(beginning|start|начал\w*)"
+    r"|(beginning|start|начал\w*).{0,40}(net\s+book\s+value|балансов\w*\s+стоимост\w*)",
+    re.IGNORECASE,
+)
+_NBV_END_RE = re.compile(
+    r"(net\s+book\s+value|балансов\w*\s+стоимост\w*).{0,40}(end|clos\w*|конец|конц\w*)"
+    r"|(end|clos\w*|конец|конц\w*).{0,40}(net\s+book\s+value|балансов\w*\s+стоимост\w*)",
+    re.IGNORECASE,
+)
+_DEPRECIATION_CHARGE_RE = re.compile(
+    r"depreciation\s+(charge|expense)|амортизацион\w*\s+отчислен\w*|начислен\w*\s+амортизац\w*",
+    re.IGNORECASE,
+)
+_READY_CAPEX_RE = re.compile(
+    r"capital\s+expenditur\w*|\bcapex\b|капитальн\w*\s+затрат\w*|капитальн\w*\s+вложен\w*",
+    re.IGNORECASE,
+)
+
+
+def _derive_capex_from_nbv_roll_forward(other_facts: tuple[OtherFact, ...]) -> OtherFact | None:
+    """capex = NBV_end - NBV_start + depreciation, when a document discloses
+    a PP&E roll-forward note (opening/closing net book value + the year's
+    depreciation charge) instead of a single ready-made capex figure.
+
+    Confirmed necessary on the public dataset: P5's Group-parent financial
+    notes disclose exactly this roll-forward ("Net book value at the
+    beginning/end of the year", "Depreciation charge for the year") for its
+    PP&E note, but never states a "capital expenditure"/"капитальные
+    затраты" figure directly anywhere in the document — the extractor
+    faithfully pulls out the three raw line items as separate other_facts,
+    but nothing downstream previously combined them, so a covenant whose
+    numerator needs Group capex saw none of its off-ledger facts match.
+
+    Deliberately code-only arithmetic, not an LLM computation — the three
+    inputs are still LLM-extracted facts (each independently sourced from
+    its own source_quote), this only does the addition. Skipped entirely
+    if a fact already looks like a ready-made capex figure (a direct
+    disclosure is always preferred over a derived one), or if any of the
+    three roll-forward components is missing — a partial roll-forward
+    (e.g. depreciation without both NBV endpoints) isn't safe to guess at.
+    """
+    if any(fact.value is not None and _READY_CAPEX_RE.search(fact.fact_description) for fact in other_facts):
+        return None
+
+    nbv_start = next(
+        (f for f in other_facts if f.value is not None and _NBV_START_RE.search(f.fact_description)), None
+    )
+    nbv_end = next((f for f in other_facts if f.value is not None and _NBV_END_RE.search(f.fact_description)), None)
+    depreciation = next(
+        (f for f in other_facts if f.value is not None and _DEPRECIATION_CHARGE_RE.search(f.fact_description)), None
+    )
+    if nbv_start is None or nbv_end is None or depreciation is None:
+        return None
+
+    capex = nbv_end.value - nbv_start.value + depreciation.value
+    return OtherFact(
+        # Deliberately short — match_category_by_text scores on stem
+        # *overlap ratio* (matched / len(target_stems)), so padding this
+        # with an explanation of the arithmetic (as an earlier version did)
+        # dilutes the ratio and can drop a genuine match below
+        # CATEGORY_MATCH_THRESHOLD. The provenance lives in source_quote.
+        fact_description="Капитальные затраты Группы",
+        value=capex,
+        unit=nbv_end.unit,
+        period=nbv_end.period,
+        source_quote=f"{nbv_start.source_quote} | {nbv_end.source_quote} | {depreciation.source_quote}",
+    )
+
+
+def _effective_other_facts(linked: LinkedScenarioData) -> tuple[OtherFact, ...]:
+    """linked.other_facts, plus a code-derived capex fact when the raw
+    facts contain a PP&E roll-forward but no ready capex figure — see
+    _derive_capex_from_nbv_roll_forward. Computed fresh (cheap regex scan
+    over a handful of facts) rather than cached on LinkedScenarioData, so
+    this has no effect on any other reader of linked.other_facts.
+    """
+    derived = _derive_capex_from_nbv_roll_forward(linked.other_facts)
+    if derived is None:
+        return linked.other_facts
+    return linked.other_facts + (derived,)
+
+
+def _addback_magnitude(
+    specs: list[CategorySpec],
+    all_specs: list[CategorySpec],
+    linked: LinkedScenarioData,
+    *,
+    excluded_txn_id: str | None,
+    revert_txn_id: str | None,
+    log_context: str,
+) -> tuple[float, int]:
+    """Idea 3 (offline audit): (signed delta, count) for `action="addback"`
+    reclassifications whose scenario-wide best-matching category (by the
+    auditor's own original_category label) is among `specs` — same
+    single-best-match rule as _other_facts_magnitude, so one addback can't
+    double-count into two covenants/roles.
+
+    The caller must add the returned delta into its *signed* running total
+    BEFORE taking abs() — NOT onto the abs()'d magnitude the way
+    other_facts is added (other_facts has no ledger sign convention at
+    all; an addback's magnitude is always +abs(txn.amount), the mirror of
+    a real, already-negative ledger outflow this same transaction
+    contributed elsewhere in the same sum). Confirmed as a real,
+    currently-unrepresented pattern on the public dataset: P4 6.1 defines
+    "Скорректированная EBITDA" as revenue minus operating expenses "с
+    прибавлением разовых статей, признанных аудиторами... подлежащими
+    обратному добавлению" (plus one-time items the auditors approve
+    adding back) — before this, AuditReclassification had no action that
+    could represent "add this back", so even a perfectly-extracted
+    finding of this shape had nowhere to go.
+
+    Deliberately does NOT touch effective_category — the flagged
+    transaction still counts normally in whatever category it naturally
+    falls under (e.g. as a real cost in an *unadjusted* expense covenant).
+    Adding +abs(txn.amount) back into the same signed `net` the per-spec
+    loop already put -abs(txn.amount) into cancels that one item back to
+    zero net effect — which is exactly what "adjusted" means — without
+    needing new per-covenant-scoped exclusion machinery.
+
+    Unvalidated against a real extraction: action="addback" didn't exist
+    in the schema before this, so no cached document has ever populated
+    it — this is forward-looking infrastructure, covered by synthetic
+    tests, not a fix confirmed against a live P4 run.
+    """
+    magnitude = 0.0
+    count = 0
+    by_txn_id = {t.txn_id: t for t in linked.transactions}
+    for reclass in linked.reclassifications.values():
+        if reclass.action != "addback":
+            continue
+        if reclass.txn_id in (excluded_txn_id, revert_txn_id):
+            continue
+        txn = by_txn_id.get(reclass.txn_id)
+        if txn is None or txn.amount is None:
+            continue
+        label = reclass.original_category or reclass.reasoning
+        best = match_category_by_text(label, all_specs)
+        if best is None:
+            continue
+        if best[0] in specs:
+            magnitude += abs(txn.amount)
+            count += 1
+            continue
+        local = match_category_by_text(label, specs)
+        if local is not None:
+            logger.warning(
+                "%s: addback reclassification %r also matches this side locally, but its "
+                "scenario-wide best match is %r — counted there only, not here, to avoid "
+                "double-counting the same addback into two covenants/roles.",
+                log_context,
+                label,
                 best[0].key,
             )
     return magnitude, count
@@ -498,6 +860,31 @@ def compute_metric(
                 excluded_txn_id=excluded_txn_id,
                 revert_txn_id=revert_txn_id,
             )
+            if count == 0:
+                borrowed_total, borrowed_count = _borrow_sibling_category_sum(
+                    [spec],
+                    spec.description,
+                    linked,
+                    clause,
+                    excluded_txn_id=excluded_txn_id,
+                    revert_txn_id=revert_txn_id,
+                    log_context=f"covenant {clause.covenant_key} component {spec.component_label or spec.key}",
+                )
+                total += borrowed_total
+                count += borrowed_count
+            # addback folds into the signed `total` before abs(), same
+            # reasoning as _resolve_side_sum — it cancels a cost already
+            # counted by the per-spec sum above, it doesn't add a new one.
+            addback_delta, addback_count = _addback_magnitude(
+                [spec],
+                linked.category_specs,
+                linked,
+                excluded_txn_id=excluded_txn_id,
+                revert_txn_id=revert_txn_id,
+                log_context=f"covenant {clause.covenant_key} component {spec.component_label or spec.key}",
+            )
+            total += addback_delta
+            count += addback_count
             # Each component is matched against other_facts *individually*
             # (a single-spec list, not the whole role) — components must
             # stay separate for max() to mean anything; summing a fact into
@@ -507,7 +894,7 @@ def compute_metric(
             fact_magnitude, fact_count = _other_facts_magnitude(
                 [spec],
                 linked.category_specs,
-                linked.other_facts,
+                _effective_other_facts(linked),
                 log_context=f"covenant {clause.covenant_key} component {spec.component_label or spec.key}",
             )
             component_results.append((abs(total) + fact_magnitude, count + fact_count))

@@ -129,6 +129,11 @@ class RelatedPartyTextTest(unittest.TestCase):
         self.assertFalse(is_related_party_text("операционные расходы"))
         self.assertFalse(is_related_party_text(None))
 
+    def test_detects_kazakh_related_party_language(self) -> None:
+        # H4 (red-team): Kazakh phrasing for "related party"/"affiliated".
+        self.assertTrue(is_related_party_text("байланысты тарапқа төлемдер"))
+        self.assertTrue(is_related_party_text("аффилирленген тұлғалар"))
+
 
 class UnrestrictedSubsidiaryTextTest(unittest.TestCase):
     def test_detects_the_real_public_dataset_phrasing(self) -> None:
@@ -140,6 +145,11 @@ class UnrestrictedSubsidiaryTextTest(unittest.TestCase):
             )
         )
         self.assertTrue(is_unrestricted_subsidiary_text("transferred to an Unrestricted Subsidiary"))
+
+    def test_detects_kazakh_phrasing(self) -> None:
+        # H4 (red-team): Kazakh phrasing for "unrestricted subsidiary".
+        self.assertTrue(is_unrestricted_subsidiary_text("шектеусіз еншілес ұйымға берілген активтер"))
+        self.assertTrue(is_unrestricted_subsidiary_text("шектелмеген еншілес компания"))
 
     def test_does_not_flag_a_bare_subsidiary_mention(self) -> None:
         # Deliberately narrow — plain "дочерняя организация" (no
@@ -210,6 +220,16 @@ class DateParsingTest(unittest.TestCase):
         period = (date(2025, 10, 1), date(2025, 12, 31))
         self.assertTrue(date_in_range("2025-11-15", period))
         self.assertFalse(date_in_range("2025-05-01", period))
+
+    def test_calendar_invalid_iso_shaped_string_returns_none_not_raises(self) -> None:
+        # Red-team finding M1: "9999-99-99" matches _ISO_RE's pattern but
+        # isn't a real calendar date — date() used to raise ValueError,
+        # uncaught, contradicting this module's own "degrades, never
+        # raises" docstring promise.
+        self.assertIsNone(parse_period("9999-99-99"))
+
+    def test_calendar_invalid_year_month_shaped_string_returns_none_not_raises(self) -> None:
+        self.assertIsNone(parse_period("отчёт за 2025-13"))
 
 
 class LinkReclassificationsTest(unittest.TestCase):

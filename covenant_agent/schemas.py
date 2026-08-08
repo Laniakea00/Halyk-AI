@@ -234,7 +234,7 @@ class AuditReclassification(BaseModel):
         description="Any date or period stated for the reclassified item (ISO date if exact, "
         "otherwise as stated, e.g. 'Q1 2025'). Null if none stated."
     )
-    action: Literal["recategorize", "exclude_from_period", "no_change"] = Field(
+    action: Literal["recategorize", "exclude_from_period", "no_change", "addback"] = Field(
         description="'recategorize' if the item was moved to a different category — "
         "original_category and reclassified_category are both given. "
         "'exclude_from_period' if the finding says this specific transaction should be "
@@ -243,7 +243,12 @@ class AuditReclassification(BaseModel):
         "suggests — 'исключена из ковенантного периода', 'относится к периоду ...'). "
         "'no_change' if the finding says a reclassification was considered or requested but "
         "was explicitly REJECTED, or that no reclassification was needed — this is purely "
-        "informational and must never change any calculation."
+        "informational and must never change any calculation. "
+        "'addback' if the finding says a specific one-time item should be added back into an "
+        "adjusted metric (e.g. 'Скорректированная EBITDA... с прибавлением разовых статей, "
+        "признанных аудиторами подлежащими обратному добавлению') — give original_category "
+        "as the item's own label (what it names itself as, e.g. 'Разовые расходы на "
+        "реструктуризацию'); reclassified_category stays null."
     )
     original_category: Optional[str] = Field(
         description="The category the item was originally recorded under, in the source "

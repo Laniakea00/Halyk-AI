@@ -39,6 +39,15 @@ KIND_MARKERS: dict[str, tuple[str, ...]] = {
         "примечания к финансовой отчётности",
         "notes to financial statements",
         "дополнение о соблюдении ковенантов",
+        # H4 (red-team): Kazakh coverage gap — every marker above was
+        # Russian/English only, so a Kazakh-language notes/statements
+        # document scored 0 against every kind and fell through to "other",
+        # invisible to every downstream layer. Not confirmed as a live
+        # occurrence on the public dataset (all 200 documents are
+        # Russian/English) — a defensive gap closed ahead of the private
+        # dataset, same reasoning as the H1-H3/M1/M4 hardening pass.
+        "қаржылық есептілік",  # financial statements/reporting
+        "табыс",  # income/revenue
     ),
     "credit_agreement": (
         "договор банковского займа",
@@ -46,6 +55,9 @@ KIND_MARKERS: dict[str, tuple[str, ...]] = {
         "финансовые ковенанты",
         "заёмщик",
         "кредитор",
+        "несиелік келісім",  # credit/loan agreement (kk)
+        "шарт",  # agreement/contract (kk)
+        "міндеттемелер",  # obligations/liabilities (kk)
     ),
     "kyc_dossier": (
         "знай своего клиент",
