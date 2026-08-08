@@ -26,6 +26,7 @@ def _clause(carve_outs) -> CovenantClause:
         numerator_description=None,
         denominator_description=None,
         components=[],
+        net_against_description=None,
         threshold_value=100.0,
         threshold_unit="usd",
         direction="max",

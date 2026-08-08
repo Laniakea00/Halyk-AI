@@ -92,6 +92,23 @@ category even though money did come in.
 - Never decide or imply anything about covenant compliance — you are only labeling what each \
 transaction is, not evaluating any limit.
 - Classify every transaction you are given, using its exact txn_id, exactly once each.
+- Before marking a transaction 'unclassified', re-check it specifically against every category \
+that could plausibly apply — a genuine, unambiguous match is sometimes missed simply because a \
+transaction sits among many others in the same batch, not because the description was actually \
+unclear. If a description is a plain, textbook instance of a category's own concept, classify \
+it — do not default to 'unclassified' out of general caution once a real match is that clear.
+
+Worked examples of unambiguous matches that must NOT be left unclassified (these are the exact \
+shape of match to accept, not a request to match these literal strings):
+- "Plant operating and maintenance expenses" against a category meaning operating expenses — \
+a plain, direct instance of the category's own concept. Classify it.
+- "Purchase of blast freezer equipment" / "Purchase of switchyard equipment" against a category \
+meaning capital expenditures — "purchase of ... equipment" is a textbook capex description. \
+Classify it.
+- "Drilling services sales settlement" against a category meaning revenue — a genuine sales \
+settlement description, no refund/rebate/return/advance language present. Classify it.
+These are exactly as unambiguous as the marketing/insurance/tax/refund decoys are exactly NOT \
+matches — apply the same confidence in both directions, not just toward caution.
 """
 
 

@@ -24,5 +24,24 @@ class DecoyGuidanceTest(unittest.TestCase):
         self.assertIn("not yet recognized revenue", SYSTEM_PROMPT.lower())
 
 
+class ObviousMatchWorkedExamplesTest(unittest.TestCase):
+    """Regression guard for the worked examples added after the 9-cell
+    post-fix forensic review: B1 and P2 both missed a textbook-clean
+    match (a plain operating-cost description, an equipment purchase)
+    despite the prompt's own abstract guidance already covering the
+    pattern — added as concrete few-shot examples, a different lever
+    than the (already-present) abstract rule.
+    """
+
+    def test_operating_expense_example_is_present(self) -> None:
+        self.assertIn("plant operating and maintenance expenses", SYSTEM_PROMPT.lower())
+
+    def test_equipment_purchase_example_is_present(self) -> None:
+        self.assertIn("purchase of blast freezer equipment", SYSTEM_PROMPT.lower())
+
+    def test_recheck_before_unclassified_instruction_is_present(self) -> None:
+        self.assertIn("before marking a transaction 'unclassified'", SYSTEM_PROMPT.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

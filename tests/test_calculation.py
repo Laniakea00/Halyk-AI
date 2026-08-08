@@ -16,6 +16,7 @@ import unittest
 from covenant_agent.calculation.evidence import find_evidence
 from covenant_agent.calculation.formulas import (
     InsufficientDataError,
+    _derive_capex_from_nbv_roll_forward,
     _quarter_number,
     _quarter_start_from_end,
     compare_to_threshold,
@@ -59,6 +60,7 @@ def _clause(
     period_start="2025-01-01",
     period_end="2025-12-31",
     components=None,
+    net_against_description=None,
 ) -> CovenantClause:
     return CovenantClause(
         covenant_key=covenant_key,
@@ -68,6 +70,7 @@ def _clause(
         numerator_description=numerator_description,
         denominator_description=denominator_description,
         components=components or [],
+        net_against_description=net_against_description,
         threshold_value=threshold_value,
         threshold_unit=threshold_unit,
         direction=direction,
@@ -129,16 +132,20 @@ class ComputeMetricRatioTest(unittest.TestCase):
         with self.assertRaises(InsufficientDataError):
             compute_metric(_clause(), linked)
 
-    def test_zero_numerator_with_real_denominator_does_not_raise(self) -> None:
-        # Denominator has real data; numerator being genuinely zero (no
-        # matching transactions) is a legitimate "actual=0.0", not a
-        # categorization failure — only the denominator side is checked.
+    def test_zero_numerator_now_raises_insufficient_data(self) -> None:
+        # Fix 2 (offline post-fix review): reversed from the original
+        # "denominator-only" design after P4 6.1 confirmed the same "0
+        # matched transactions" ambiguity applies to the numerator side —
+        # a real business "this is genuinely zero" and "the classifier
+        # found nothing" look identical here too, and silently returning
+        # 0.0 let a total numerator miss masquerade as an ordinary,
+        # plausible ratio result instead of surfacing as insufficient data.
         txns = [_txn("T2", -400.0)]
         linked = _linked(
             txns, category_specs=[NUM_SPEC, DEN_SPEC], txn_category={"T2": "6.1_denominator"}
         )
-        actual = compute_metric(_clause(), linked)
-        self.assertAlmostEqual(actual, 0.0)
+        with self.assertRaises(InsufficientDataError):
+            compute_metric(_clause(), linked)
 
     def test_related_party_denominator_zero_does_not_raise(self) -> None:
         # Related-party sides are exempt from the insufficient-data check —
@@ -151,6 +158,21 @@ class ComputeMetricRatioTest(unittest.TestCase):
         txns = [_txn("T1", 1000.0)]
         linked = _linked(
             txns, category_specs=[NUM_SPEC], txn_category={"T1": "6.1_numerator"}
+        )
+        actual = compute_metric(clause, linked)  # should not raise
+        self.assertGreaterEqual(actual, 0.0)
+
+    def test_related_party_numerator_zero_does_not_raise(self) -> None:
+        # Symmetric to the denominator case above, now that Fix 2 checks
+        # both sides — a related-party numerator being genuinely zero must
+        # stay exempt too, not just when it happens to be the denominator.
+        clause = _clause(
+            numerator_description="платежи в пользу связанных сторон",
+            denominator_description="operating expenses",
+        )
+        txns = [_txn("T1", -400.0)]
+        linked = _linked(
+            txns, category_specs=[DEN_SPEC], txn_category={"T1": "6.1_denominator"}
         )
         actual = compute_metric(clause, linked)  # should not raise
         self.assertGreaterEqual(actual, 0.0)
@@ -486,6 +508,69 @@ class OtherFactsWiringTest(unittest.TestCase):
         self.assertAlmostEqual(actual_62, 300.0)  # not double-counted here
 
 
+class NetAgainstMaxSingleComponentTest(unittest.TestCase):
+    """Prompt fix B (offline post-fix review): "Выручка за вычетом
+    наибольшей из величин Расходов на оплату труда и Налогов" — real P10
+    6.2 numbers throughout, confirmed against the actual ground_truth.json
+    value (6,000,763.63).
+    """
+
+    NET_AGAINST_SPEC = CategorySpec(key="6.2_net_against", covenant_key="6.2", role="net_against", description="Выручка")
+    COMP0 = CategorySpec(key="6.2_component_0", covenant_key="6.2", role="component", description="Расходов на оплату труда")
+    COMP1 = CategorySpec(key="6.2_component_1", covenant_key="6.2", role="component", description="Налогов")
+
+    def test_nets_revenue_against_the_larger_component(self) -> None:
+        txns = [
+            _txn("REV", 7204882.16, description="revenue"),
+            _txn("PAY", -1204118.53, description="Terminal staff payroll disbursement 2025"),
+            _txn("TAX", -882447.19, description="Corporate income tax instalment 2025"),
+        ]
+        linked = _linked(
+            txns,
+            category_specs=[self.NET_AGAINST_SPEC, self.COMP0, self.COMP1],
+            txn_category={"REV": "6.2_net_against", "PAY": "6.2_component_0", "TAX": "6.2_component_1"},
+        )
+        clause = _clause(
+            covenant_key="6.2",
+            metric_type="max_single_component",
+            components=["Расходов на оплату труда", "Налогов"],
+            net_against_description="Выручка",
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 6000763.63, places=2)  # real ground_truth.json value for P10 6.2
+
+    def test_without_net_against_description_behaves_as_before(self) -> None:
+        # No net_against_description set — must fall back to the bare
+        # max(components) behavior that predates this fix, unchanged.
+        txns = [_txn("PAY", -1204118.53), _txn("TAX", -882447.19)]
+        linked = _linked(
+            txns,
+            category_specs=[self.COMP0, self.COMP1],
+            txn_category={"PAY": "6.2_component_0", "TAX": "6.2_component_1"},
+        )
+        clause = _clause(
+            covenant_key="6.2", metric_type="max_single_component", components=["Расходов на оплату труда", "Налогов"]
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 1204118.53)
+
+    def test_net_against_zero_matches_raises_insufficient_data(self) -> None:
+        txns = [_txn("PAY", -1204118.53), _txn("TAX", -882447.19)]
+        linked = _linked(
+            txns,
+            category_specs=[self.NET_AGAINST_SPEC, self.COMP0, self.COMP1],
+            txn_category={"PAY": "6.2_component_0", "TAX": "6.2_component_1"},  # nothing classified as revenue
+        )
+        clause = _clause(
+            covenant_key="6.2",
+            metric_type="max_single_component",
+            components=["Расходов на оплату труда", "Налогов"],
+            net_against_description="Выручка",
+        )
+        with self.assertRaises(InsufficientDataError):
+            compute_metric(clause, linked)
+
+
 class MaxSingleComponentOtherFactsTest(unittest.TestCase):
     def test_fact_adds_to_its_own_matching_component_only(self) -> None:
         comp0 = CategorySpec(
@@ -543,6 +628,21 @@ class CapexRollForwardDerivationTest(unittest.TestCase):
     # tests below.
     AMOUNT_SPEC = CategorySpec(key="6.1_amount", covenant_key="6.1", role="amount", description=NUM_SPEC.description)
 
+    def test_derivation_success_is_logged(self) -> None:
+        # Fix 6 (offline post-fix review): the deriver had no success log,
+        # making it impossible to confirm from a live run's logs whether
+        # it fired at all — confirmed as a real observability gap while
+        # forensically reviewing fullrun_a/fullrun_b.
+        facts = (
+            _fact("Net book value at the beginning of the year", 148028989.69),
+            _fact("Depreciation charge for the year", 15826229.43),
+            _fact("Net book value at the end of the year", 154050122.81),
+        )
+        with self.assertLogs("covenant_agent.calculation.formulas", level="INFO") as cm:
+            derived = _derive_capex_from_nbv_roll_forward(facts)
+        self.assertIsNotNone(derived)
+        self.assertTrue(any("Derived capex" in message for message in cm.output))
+
     def test_derives_capex_from_nbv_roll_forward_when_no_ready_figure(self) -> None:
         facts = [
             _fact("Net book value at the beginning of the year", 148028989.69),
@@ -583,9 +683,8 @@ class CapexRollForwardDerivationTest(unittest.TestCase):
             numerator_description=self.NUM_SPEC.description,
             denominator_description="EBITDA",
         )
-        # Ratio numerators are not data-checked (only denominators are, per
-        # compute_metric) — assert the derivation didn't fire by checking
-        # the numerator side directly via aggregate_amount instead.
+        # Check the aggregate_amount shape directly too (same underlying
+        # side-resolution code path, cleaner to assert on in isolation).
         agg_clause = _clause(
             covenant_key="6.1",
             metric_type="aggregate_amount",
@@ -598,8 +697,12 @@ class CapexRollForwardDerivationTest(unittest.TestCase):
         )
         with self.assertRaises(InsufficientDataError):
             compute_metric(agg_clause, agg_linked)
-        # Sanity: the ratio call itself still runs (denominator has data).
-        compute_metric(clause, linked)
+        # Fix 2 (offline post-fix review): the ratio call now *also* raises
+        # — a numerator that stayed empty (partial roll-forward correctly
+        # not derived) is InsufficientDataError too, not a silent 0.0,
+        # since numerator zero-counts are checked the same as denominator's.
+        with self.assertRaises(InsufficientDataError):
+            compute_metric(clause, linked)
 
     def test_ready_capex_figure_takes_precedence_over_derivation(self) -> None:
         # A direct disclosure must win outright — not be added on top of a
@@ -656,6 +759,37 @@ class SiblingCategoryBorrowTest(unittest.TestCase):
         )
         actual = compute_metric(clause, linked)
         self.assertAlmostEqual(actual, 2.0)  # 2000 / 1000(borrowed) — not InsufficientDataError
+
+    def test_netted_role_borrows_each_part_from_a_different_sibling(self) -> None:
+        # Fix 5 (offline post-fix review, confirmed on P5 6.1): a *netted*
+        # denominator (revenue net of opex, split into two specs) used to
+        # borrow using the combined text once, finding only a revenue
+        # sibling and completely missing the opex deduction. Each part
+        # must now be able to borrow from a *different* sibling covenant.
+        rev_part = CategorySpec(key="6.1_denominator_part0", covenant_key="6.1", role="denominator", description="Выручка")
+        opex_part = CategorySpec(
+            key="6.1_denominator_part1", covenant_key="6.1", role="denominator", description="Операционных расходов"
+        )
+        sibling_revenue = CategorySpec(
+            key="6.2_amount",
+            covenant_key="6.2",
+            role="amount",
+            description="совокупный объём поступлений по статье «Выручка», понимаемых как суммы, отнесённые к данной статье",
+        )
+        sibling_opex = CategorySpec(
+            key="6.3_amount", covenant_key="6.3", role="amount", description="Совокупные операционные расходы Заёмщика"
+        )
+        txns = [_txn("NUMTXN", 2000.0), _txn("REV", 1000.0), _txn("OPEX", -300.0)]
+        linked = _linked(
+            txns,
+            category_specs=[NUM_SPEC, rev_part, opex_part, sibling_revenue, sibling_opex],
+            txn_category={"NUMTXN": "6.1_numerator", "REV": "6.2_amount", "OPEX": "6.3_amount"},
+        )
+        clause = _clause(
+            covenant_key="6.1", numerator_description="revenue", denominator_description="EBITDA"
+        )
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 2000.0 / 700.0)  # denominator = 1000(revenue) - 300(opex) = 700
 
     def test_does_not_borrow_when_own_category_already_has_data(self) -> None:
         # No override/double-count: if 6.1's own denominator already found

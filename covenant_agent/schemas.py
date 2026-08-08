@@ -74,6 +74,16 @@ class CovenantClause(BaseModel):
         "component named in the clause — do not merge them. Empty list for every other "
         "metric_type."
     )
+    net_against_description: Optional[str] = Field(
+        description="For metric_type='max_single_component' only: set this when the clause's "
+        "measured value is some OTHER amount minus the largest component, not the largest "
+        "component's own value (e.g. 'Выручка за вычетом наибольшей из величин Расходов на "
+        "оплату труда и Налогов' — the measured value is Revenue minus whichever of the two "
+        "named components is larger, not that component alone). Give the short label of that "
+        "other amount in the source language (e.g. 'Выручка'), the same way a component label "
+        "is given. Null when the clause's measured value genuinely IS just the largest "
+        "component on its own, with nothing subtracted from anything."
+    )
     threshold_value: float = Field(
         description="The numeric limit stated in the clause. Always positive, even if the "
         "clause concerns an expense or outflow."

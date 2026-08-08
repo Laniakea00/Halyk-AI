@@ -46,6 +46,15 @@ aggregation_note; do not silently normalize it into a plain sum. When metric_typ
 'max_single_component', list every named component in the `components` field, each as its own \
 short entry — a downstream system will need to categorize transactions against these exact \
 component names, so do not merge or paraphrase two components into one.
+- A 'max_single_component' clause sometimes measures the largest component ON ITS OWN (nothing \
+subtracted from anything) — but sometimes measures some OTHER amount minus whichever named \
+component is larger (e.g. "Выручка за вычетом наибольшей из величин Расходов на оплату труда и \
+Налогов" = Revenue MINUS whichever of {payroll, taxes} is larger, not payroll/taxes alone). Read \
+the clause carefully for this distinction — a "минус"/"за вычетом"/"net of"/"minus" right before \
+the largest-of-N language means the second shape applies. When it does, set \
+`net_against_description` to a short label (source language) for that other amount (e.g. \
+"Выручка"). Leave it null when the measured value genuinely is just the largest component with \
+nothing netted against it.
 - numerator_description/denominator_description/formula_description feed a downstream system \
 that matches them against transaction descriptions — a bare defined-term name is useless to it, \
 and so is an abstract restatement that doesn't decompose into things a transaction can actually \

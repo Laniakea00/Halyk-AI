@@ -89,6 +89,7 @@ class ExtractScenarioFactsTest(unittest.TestCase):
                     numerator_description="a",
                     denominator_description="b",
                     components=[],
+                    net_against_description=None,
                     threshold_value=1.0,
                     threshold_unit="ratio",
                     direction="max",
