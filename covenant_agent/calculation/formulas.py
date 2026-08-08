@@ -14,11 +14,18 @@ different formula on almost every borrower in the public dataset).
 
 from __future__ import annotations
 
+import logging
 import re
 
-from covenant_agent.linking.categories import is_related_party_text, match_category_by_text
+from covenant_agent.linking.categories import (
+    is_related_party_text,
+    is_unrestricted_subsidiary_text,
+    match_category_by_text,
+)
 from covenant_agent.models import CategorySpec, LinkedScenarioData, Transaction
-from covenant_agent.schemas import CovenantClause
+from covenant_agent.schemas import CovenantClause, OtherFact
+
+logger = logging.getLogger(__name__)
 
 
 class InsufficientDataError(RuntimeError):
@@ -62,9 +69,13 @@ def _needs_data_check(description_text: str | None) -> bool:
     """True if a zero-count side of this shape is suspicious enough to flag.
 
     See InsufficientDataError's docstring — related-party sides get a pass
-    because a real zero is a normal outcome there.
+    because a real zero is a normal outcome there. "Unrestricted
+    Subsidiary"-style sides (P9's 6.1) get the same pass, same reasoning —
+    see is_unrestricted_subsidiary_text's docstring for why this is a
+    deliberately narrow, code-only exemption and not a new resolution
+    mechanism.
     """
-    return not is_related_party_text(description_text)
+    return not (is_related_party_text(description_text) or is_unrestricted_subsidiary_text(description_text))
 
 
 # Numerical safety net for _safe_ratio only, once InsufficientDataError has
@@ -318,14 +329,14 @@ def _resolve_side_sum(
     Off-ledger facts (linked.other_facts — a document-level figure with no
     corresponding ledger transaction at all, e.g. an accrued severance
     obligation disclosed in a note) are added on top when one matches this
-    role's own category text, via the same match_category_by_text stem-
-    overlap machinery already used to resolve a reclassification's target
-    category — confirmed necessary on the public dataset: P8's 6.1
-    ("Совокупные обязательства по персоналу") is genuinely the sum of paid
-    payroll transactions *plus* a severance-program obligation that will
-    never appear as a ledger row. A matched fact counts toward `count` too,
-    so a covenant whose ledger side is empty but has a real off-ledger
-    figure doesn't spuriously raise InsufficientDataError.
+    role's own category text — see _other_facts_magnitude for the
+    scenario-wide, at-most-once-per-fact matching rule. Confirmed
+    necessary on the public dataset: P8's 6.1 ("Совокупные обязательства
+    по персоналу") is genuinely the sum of paid payroll transactions
+    *plus* a severance-program obligation that will never appear as a
+    ledger row. A matched fact counts toward `count` too, so a covenant
+    whose ledger side is empty but has a real off-ledger figure doesn't
+    spuriously raise InsufficientDataError.
 
     A fact's value is combined as a *magnitude*, added after abs(net), not
     mixed into the signed running total — OtherFact.value has no ledger
@@ -359,16 +370,62 @@ def _resolve_side_sum(
         net += spec_total
         count += spec_count
 
-    fact_magnitude = 0.0
-    for fact in linked.other_facts:
+    fact_magnitude, fact_count = _other_facts_magnitude(
+        role_specs,
+        linked.category_specs,
+        linked.other_facts,
+        log_context=f"covenant {clause.covenant_key} {role}",
+    )
+    return abs(net) + fact_magnitude, count + fact_count
+
+
+def _other_facts_magnitude(
+    specs: list[CategorySpec],
+    all_specs: list[CategorySpec],
+    other_facts: tuple[OtherFact, ...],
+    *,
+    log_context: str,
+) -> tuple[float, int]:
+    """Sum of other_facts whose single *scenario-wide best-matching* category
+    is among `specs` — not just whichever facts happen to clear the match
+    threshold against `specs` alone, which is what a naive per-call re-match
+    would do and would let the same fact double-count into two different
+    covenants (or two different roles/components of the same covenant) if
+    its wording happens to overlap both.
+
+    `match_category_by_text` already picks the single highest-scoring spec
+    out of whatever list it's given — passing the *whole scenario's*
+    `all_specs` here (not just `specs`) makes that pick a genuine, unique,
+    scenario-wide winner, then this only credits the fact to `specs` if
+    that winner is a member of it. A fact that would have cleared
+    threshold against `specs` on its own merits, but scores higher
+    elsewhere in the scenario, is logged (not silently dropped) so a
+    private-dataset ambiguity is visible.
+    """
+    magnitude = 0.0
+    count = 0
+    for fact in other_facts:
         if fact.value is None:
             continue
-        match = match_category_by_text(fact.fact_description, role_specs)
-        if match is not None:
-            fact_magnitude += fact.value
+        best = match_category_by_text(fact.fact_description, all_specs)
+        if best is None:
+            continue
+        if best[0] in specs:
+            magnitude += fact.value
             count += 1
-
-    return abs(net) + fact_magnitude, count
+            continue
+        local = match_category_by_text(fact.fact_description, specs)
+        if local is not None:
+            logger.warning(
+                "%s: other_fact %r also matches this side locally, but its "
+                "scenario-wide best match is %r — counted there only, not "
+                "here, to avoid double-counting the same fact into two "
+                "covenants/roles.",
+                log_context,
+                fact.fact_description,
+                best[0].key,
+            )
+    return magnitude, count
 
 
 def _safe_ratio(numerator: float, denominator: float) -> float:
@@ -431,8 +488,9 @@ def compute_metric(
     if clause.metric_type == "max_single_component":
         covenant_specs = [s for s in linked.category_specs if s.covenant_key == clause.covenant_key]
         component_specs = [s for s in covenant_specs if s.role == "component"] or covenant_specs
-        component_results = [
-            _category_signed_sum(
+        component_results = []
+        for spec in component_specs:
+            total, count = _category_signed_sum(
                 spec.key,
                 linked,
                 covenant_specs,
@@ -440,21 +498,32 @@ def compute_metric(
                 excluded_txn_id=excluded_txn_id,
                 revert_txn_id=revert_txn_id,
             )
-            for spec in component_specs
-        ]
-        # Zero transactions across *every* component at once means the
-        # classifier found nothing for this test at all — same "we don't
-        # know" signal as a ratio's empty denominator, not "every
+            # Each component is matched against other_facts *individually*
+            # (a single-spec list, not the whole role) — components must
+            # stay separate for max() to mean anything; summing a fact into
+            # every component would be wrong even before the
+            # cross-covenant double-count risk _other_facts_magnitude
+            # otherwise guards against.
+            fact_magnitude, fact_count = _other_facts_magnitude(
+                [spec],
+                linked.category_specs,
+                linked.other_facts,
+                log_context=f"covenant {clause.covenant_key} component {spec.component_label or spec.key}",
+            )
+            component_results.append((abs(total) + fact_magnitude, count + fact_count))
+        # Zero transactions/facts across *every* component at once means
+        # the classifier found nothing for this test at all — same "we
+        # don't know" signal as a ratio's empty denominator, not "every
         # component is genuinely zero" (implausible for real overhead
         # lines). A partial finding (some components populated, others
         # not) is left alone — genuinely ambiguous, not the clear-cut
         # total-miss case this guards against.
-        if component_results and sum(count for _sum, count in component_results) == 0:
+        if component_results and sum(count for _total, count in component_results) == 0:
             raise InsufficientDataError(
                 f"covenant {clause.covenant_key}: max_single_component matched 0 "
                 f"transactions across all {len(component_specs)} component(s)"
             )
-        sums = [abs(total) for total, _count in component_results]
+        sums = [total for total, _count in component_results]
         return max(sums) if sums else 0.0
 
     # aggregate_amount and other (best-effort fallback — see categories.py).

@@ -58,6 +58,41 @@ def is_related_party_text(text: str | None) -> bool:
     return bool(_RELATED_PARTY_RE.search(text))
 
 
+_UNRESTRICTED_SUBSIDIARY_RE = re.compile(
+    r"неограниченн\w*\s+дочерн\w*|unrestricted\s+subsidiar\w*", re.IGNORECASE
+)
+
+
+def is_unrestricted_subsidiary_text(text: str | None) -> bool:
+    """True if `text` is about "Unrestricted Subsidiary"-style designation.
+
+    Confirmed on the public dataset: P9's covenant 6.1 numerator
+    ("активов, переданных Неограниченным дочерним организациям") names a
+    counterparty-identity question — which entities carry this
+    designation — but checking all of P9's own documents (KYC dossier,
+    financial_notes, credit agreement, full text) directly found *no*
+    disclosure anywhere naming which counterparty, if any, is designated
+    an Unrestricted Subsidiary; the term only appears inside the credit
+    agreement's own definition of the concept. A genuine zero for this
+    side (no such transfer disclosed) is therefore a normal business fact,
+    not a categorization miss — same reasoning as is_related_party_text's
+    InsufficientDataError exemption (see formulas.py's
+    _needs_data_check), reused here rather than building a parallel
+    related-party-style resolution mechanism with zero real examples to
+    validate it against (see README's Task B design note for the full
+    tradeoff). Deliberately narrow — requires "неограниченн" AND "дочерн"
+    together (or the English equivalent), not a bare "дочерн" check, which
+    would also fire on ordinary subsidiary mentions that have nothing to
+    do with this designation and don't deserve the same exemption. This
+    does NOT route the side away from ordinary transaction categorization
+    the way is_related_party_text does (see derive_category_specs) — only
+    exempts a resulting zero from being flagged as suspicious.
+    """
+    if not text:
+        return False
+    return bool(_UNRESTRICTED_SUBSIDIARY_RE.search(text))
+
+
 def derive_category_specs(covenants: CovenantExtractionResult) -> list[CategorySpec]:
     """One CategorySpec per (covenant, role) that needs description-based
     transaction classification — i.e. everything except related-party

@@ -13,6 +13,7 @@ from covenant_agent.linking.categories import (
     _split_compound,
     _strip_defined_as_prefix,
     is_related_party_text,
+    is_unrestricted_subsidiary_text,
     match_category_by_text,
 )
 from covenant_agent.linking.dates import date_in_range, parse_period
@@ -127,6 +128,25 @@ class RelatedPartyTextTest(unittest.TestCase):
     def test_does_not_flag_unrelated_text(self) -> None:
         self.assertFalse(is_related_party_text("операционные расходы"))
         self.assertFalse(is_related_party_text(None))
+
+
+class UnrestrictedSubsidiaryTextTest(unittest.TestCase):
+    def test_detects_the_real_public_dataset_phrasing(self) -> None:
+        # P9's actual 6.1 numerator text.
+        self.assertTrue(
+            is_unrestricted_subsidiary_text(
+                "совокупная стоимость капитальных активов, переданных "
+                "Неограниченным дочерним организациям за период"
+            )
+        )
+        self.assertTrue(is_unrestricted_subsidiary_text("transferred to an Unrestricted Subsidiary"))
+
+    def test_does_not_flag_a_bare_subsidiary_mention(self) -> None:
+        # Deliberately narrow — plain "дочерняя организация" (no
+        # "неограниченн") must NOT trigger this, unlike a bare "дочерн"
+        # check would.
+        self.assertFalse(is_unrestricted_subsidiary_text("дочерняя организация Заёмщика"))
+        self.assertFalse(is_unrestricted_subsidiary_text(None))
 
 
 class MatchCategoryByTextTest(unittest.TestCase):

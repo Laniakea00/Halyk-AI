@@ -153,6 +153,26 @@ class ComputeMetricRatioTest(unittest.TestCase):
         actual = compute_metric(clause, linked)  # should not raise
         self.assertGreaterEqual(actual, 0.0)
 
+    def test_unrestricted_subsidiary_numerator_zero_does_not_raise(self) -> None:
+        # Task B (lightweight fix): P9's 6.1 numerator names a
+        # counterparty-identity question ("Неограниченным дочерним
+        # организациям") with no disclosure anywhere in the public
+        # dataset — a zero here is a normal business fact, exempted from
+        # InsufficientDataError the same way related-party sides are.
+        clause = _clause(
+            numerator_description=(
+                "совокупная стоимость капитальных активов, переданных "
+                "Неограниченным дочерним организациям"
+            ),
+            denominator_description="совокупные капитальные затраты",
+        )
+        txns = [_txn("T1", -1000.0)]
+        linked = _linked(
+            txns, category_specs=[DEN_SPEC], txn_category={"T1": "6.1_denominator"}
+        )
+        actual = compute_metric(clause, linked)  # should not raise
+        self.assertEqual(actual, 0.0)
+
     def test_netted_numerator_subtracts_correctly_via_natural_sign(self) -> None:
         # revenue (positive) net of opex (already-negative outflow) should
         # subtract via plain addition, not double-subtract.
@@ -412,6 +432,89 @@ class OtherFactsWiringTest(unittest.TestCase):
         )
         actual = compute_metric(clause, linked)
         self.assertAlmostEqual(actual, 918447.52)
+
+    def test_fact_matching_two_covenants_only_counts_toward_the_better_match(self) -> None:
+        # spec_61's description shares every stem with the fact text
+        # (score 1.0); spec_62's shares half of them (score 0.5, still
+        # clears CATEGORY_MATCH_THRESHOLD=0.35 on its own) — the fact must
+        # go to 6.1 only, not both.
+        fact_text = (
+            "обязательство по программе выходных пособий сокращения удержания персонала"
+        )
+        spec_61 = CategorySpec(
+            key="6.1_amount",
+            covenant_key="6.1",
+            role="amount",
+            description=(
+                "Совокупные обязательства по персоналу означают сумму расходов на оплату "
+                "труда и обязательства по программе выходных пособий, сокращения или "
+                "удержания персонала"
+            ),
+        )
+        spec_62 = CategorySpec(
+            key="6.2_amount",
+            covenant_key="6.2",
+            role="amount",
+            description="программе обязательства персонала",
+        )
+        txns = [_txn("PAY61", -500.0), _txn("PAY62", -300.0)]
+        linked = _linked(
+            txns,
+            category_specs=[spec_61, spec_62],
+            txn_category={"PAY61": "6.1_amount", "PAY62": "6.2_amount"},
+            other_facts=[_fact(fact_text, 918447.52)],
+        )
+        clause_61 = _clause(
+            covenant_key="6.1",
+            metric_type="aggregate_amount",
+            numerator_description=None,
+            denominator_description=None,
+            formula_description="Совокупные обязательства по персоналу",
+        )
+        clause_62 = _clause(
+            covenant_key="6.2",
+            metric_type="aggregate_amount",
+            numerator_description=None,
+            denominator_description=None,
+            formula_description="программе обязательства персонала",
+        )
+        actual_61 = compute_metric(clause_61, linked)
+        actual_62 = compute_metric(clause_62, linked)
+        self.assertAlmostEqual(actual_61, 500.0 + 918447.52)  # fact counted here
+        self.assertAlmostEqual(actual_62, 300.0)  # not double-counted here
+
+
+class MaxSingleComponentOtherFactsTest(unittest.TestCase):
+    def test_fact_adds_to_its_own_matching_component_only(self) -> None:
+        comp0 = CategorySpec(
+            key="6.2_component_0", covenant_key="6.2", role="component", description="Расходы на оплату труда"
+        )
+        comp1 = CategorySpec(
+            key="6.2_component_1", covenant_key="6.2", role="component", description="Коммунальные расходы"
+        )
+        txns = [_txn("PAY", -500.0), _txn("UTIL", -300.0)]
+        linked = _linked(
+            txns,
+            category_specs=[comp0, comp1],
+            txn_category={"PAY": "6.2_component_0", "UTIL": "6.2_component_1"},
+            other_facts=[_fact("дополнительные расходы на оплату труда персонала", 1000.0)],
+        )
+        clause = _clause(covenant_key="6.2", metric_type="max_single_component")
+        actual = compute_metric(clause, linked)
+        # payroll component (500 + 1000 fact) now exceeds utilities (300).
+        self.assertAlmostEqual(actual, 1500.0)
+
+    def test_fact_alone_satisfies_insufficient_data_for_max_single_component(self) -> None:
+        comp0 = CategorySpec(key="6.2_component_0", covenant_key="6.2", role="component", description="Расходы на оплату труда")
+        comp1 = CategorySpec(key="6.2_component_1", covenant_key="6.2", role="component", description="Коммунальные расходы")
+        linked = _linked(
+            [],
+            category_specs=[comp0, comp1],
+            other_facts=[_fact("расходы на оплату труда персонала", 1000.0)],
+        )
+        clause = _clause(covenant_key="6.2", metric_type="max_single_component")
+        actual = compute_metric(clause, linked)  # must not raise
+        self.assertAlmostEqual(actual, 1000.0)
 
 
 class ExcludeFromPeriodReclassificationTest(unittest.TestCase):

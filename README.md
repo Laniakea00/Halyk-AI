@@ -92,20 +92,36 @@ follow-up pass once Block 5 exists.
 ### Known sources of instability — read before assuming something's broken
 
 - **Transaction categorization (Block 3a) is not perfectly reproducible,
-  even at temperature=0.** Measured directly on the public dataset: two
-  back-to-back runs of `run_calculation.py` with *zero* code changes
-  produced self-scores of 0.61 and 0.50. The deterministic layers
-  (linking arithmetic, formulas, evidence, fallback) are unit-tested and
-  stable — the instability is specifically in which transactions the LLM
-  puts in which category on a given pass. Don't chase a score swing across
-  runs as if it were a regression; compare against a multi-run average
-  (see "Findings" below for what we tried — self-consistency voting made
-  this *worse*, not better, so it isn't the fix).
-- **Rate limits.** The org key this was built against sits on a 30k
-  tokens/minute tier for `gpt-4.1`, which one scenario's categorization
-  call can bump into on its own. `llm_client.py` retries with real backoff
-  (up to ~6 attempts, growing delay) — a run that logs several `rate
-  limited` warnings and keeps going is working as intended, not stuck.
+  even at temperature=0.** Measured across 5 back-to-back runs on the
+  dev-profile model, *zero* code changes between them: self-scores of
+  0.5542, 0.5681, 0.5404, 0.6094, 0.5265 (mean 0.560, min 0.527, max
+  0.609). The deterministic layers (linking arithmetic, formulas,
+  evidence, fallback) are unit-tested and stable — the instability is
+  specifically in which transactions the LLM puts in which category on a
+  given pass. **Cross-referencing all 5 runs' wrong-status cells showed
+  most of that spread isn't random** — roughly half the wrong cells were
+  wrong in literally every one of the 5 runs (systematic misses, mostly
+  since root-caused: dirty ledger rows, undefined "EBITDA", missing
+  document links — see Findings), and only a handful of cells actually
+  flip between runs. Don't chase a single-run score swing as if it were a
+  regression; compare against a multi-run average, and know that a
+  "systematic" miss needs a different kind of fix than a "flips between
+  runs" one.
+- **Full 12-scenario runs are now budget-limited, not just time-limited.**
+  A single evening's worth of point-checks and full runs (this session)
+  used ~3.75M tokens total, and per-model usage wasn't being tracked at
+  all until it was reconstructed by hand afterward — see
+  `llm_client.py`'s `print_usage_summary()` (now printed automatically at
+  the end of every `scripts/run_*.py` invocation, precisely so that never
+  has to happen again). Going forward: `--scenario <id>` point-checks are
+  cheap and fine to run freely; full 12-scenario runs are reserved (at
+  most 1–2 before the actual submission run); a stability re-check needs
+  2–3 runs, not 5. Output tokens are the scarcer remaining resource —
+  prompts that ask for long free-text explanations without a real need
+  for them are a candidate to trim if budget gets tighter.
+- **Rate limits.** `llm_client.py` retries with real backoff (up to ~6
+  attempts, growing delay) — a run that logs several `rate limited`
+  warnings and keeps going is working as intended, not stuck.
 - **`insufficient_quota` looks identical to a rate limit at first glance**
   (both surface as HTTP 429) but isn't — it means the account has no
   credits left, and no amount of retrying fixes it. If a run keeps
@@ -115,30 +131,28 @@ follow-up pass once Block 5 exists.
 
 ### If the API dies mid-run — can I safely restart from the middle?
 
-**Honest current answer: partially.**
+**Yes, since the High-risk code-review findings were fixed (see below) —
+this used to be "partially", it isn't anymore.**
 
 - **Block 1 (ingestion)** is fully local and re-runs in seconds — never a
   concern.
-- **Block 2 (extraction)** checkpoints at the *whole-batch* level only:
-  `--report cache/scenario_facts.json` is written once, after every
-  scenario has been extracted. If it crashes on scenario 9 of 12, **nothing
-  is saved** — scenarios 1–8 were real, paid-for API calls, and they're
-  gone. `--scenario P1` lets you extract one scenario at a time and
-  manually track which ones are done, which is the current workaround if
-  you're burned by this once; there's no automatic per-scenario checkpoint
-  yet (see the code-review findings below — this is flagged, not fixed).
+- **Block 2 (extraction)** now saves after *every* scenario, not once at
+  the end (`--report cache/scenario_facts.json` is written incrementally).
+  A crash on scenario 9 of 12 leaves scenarios 1–8's real, paid-for
+  results on disk. `extract_all_facts` also catches any exception
+  per-scenario (not just the expected `ExtractionError` shape) and
+  degrades that one scenario to an empty result rather than aborting the
+  batch — the run finishes with a clear "N/M ok, FAILED: [...]" summary
+  naming exactly which scenarios to re-run with `--scenario <id>`.
 - **Block 3a (linking / transaction categorization)** has the same
-  whole-batch-only shape, and is actually more exposed: the categorization
-  call in `linking/pipeline.py` isn't wrapped in a try/except at all
-  today, so *any* exception there (not just a rate limit) aborts the
-  entire `run_calculation.py` invocation immediately, mid-scenario, with
-  no partial output written.
-- **Practical mitigation today:** run Block 2 to completion first and
-  confirm `--facts-cache` was written before starting Block 3 — that at
-  least banks the expensive extraction step. For Block 3, if you get
-  burned by a crash partway through 12 scenarios, `--scenario <id>` lets
-  you re-run just the scenarios you haven't confirmed yet, since Block 3a
-  doesn't mutate anything — it's safe to call repeatedly.
+  per-scenario exception isolation now — a categorization-call failure
+  degrades that one scenario to "everything unclassified" (which
+  `InsufficientDataError` then handles the normal way) instead of
+  aborting `run_calculation.py` mid-run.
+- **Practical flow today:** run Block 2 to completion (or until it
+  reports failures), confirm `--facts-cache` was written, re-run just the
+  named failures with `--scenario <id>`, then proceed to Block 3 — safe
+  to call repeatedly either way.
 
 ## Running Block 1 (Ingestion + Entity/Version resolution)
 
@@ -230,35 +244,64 @@ covenant_agent/
   config.py               paths + generic constants (nothing scenario-specific)
   models.py                the dataclass contract between pipeline stages
   schemas.py                pydantic Structured Output schemas (Block 2's LLM boundary)
-  llm_client.py              OpenAI Responses API wrapper: models, retry, raw-call logging
+  llm_client.py              OpenAI Responses API wrapper: dev/final model profiles,
+                                retry, raw-call logging, per-model usage accounting
+                                (print_usage_summary() — every script prints this)
   ingestion/
     pdf_text.py             pdftotext subprocess wrapper, content-hash disk cache
     documents.py             loads documents/*, dispatches by extension
     ledger.py                loads the CSV, derives scenario_id -> account_id
-    template.py               loads submission_template.json (source of truth for scope)
+    template.py               loads submission_template.json (source of truth for scope),
+                                 validates its structure (TemplateValidationError)
   resolution/
-    accounts.py              exact-token account matching (decoy-safe)
-    classify.py               keyword-scored document-kind classifier
+    accounts.py              exact-token account matching (decoy-safe), normalizes a
+                                letter-spaced "A C C - 7 8 0 3" PDF-rendering artifact
+                                before the same exact match runs (see Findings)
+    classify.py               keyword-scored document-kind classifier — credit_agreement,
+                                 kyc_dossier, audit_report, treasury_memo, financial_notes
+    segment_linking.py        secondary, narrower document-to-scenario linking for
+                                 documents accounts.py's ACC-token match can't place at
+                                 all (a Group-parent report never mentions the
+                                 subsidiary's own account) — exact match on the
+                                 scenario's own already-verified borrower name next to
+                                 explicit subsidiary/segment language, never a general
+                                 company-name similarity guess
     versioning.py              superseded/draft detection, current-doc selection
     pipeline.py                 orchestrates the above into an IngestionResult
   extraction/
     covenant_extraction.py    Block 2a: credit agreement -> CovenantExtractionResult
-    fact_extraction.py         Block 2b: KYC / audit / other -> their result schemas
+    fact_extraction.py         Block 2b: KYC / audit-and-financial-notes-disclosure /
+                                  other -> their result schemas (one extractor,
+                                  extract_audit_facts, now covers audit_report,
+                                  financial_notes, AND treasury_memo — see Findings)
     pipeline.py                  orchestrates 2a+2b per scenario into ScenarioFacts
     cache.py                      round-trippable save/load for ScenarioFacts (--facts-cache)
   linking/
     categories.py              derives a per-covenant transaction-category vocabulary;
                                   compound "X net of Y" / "X and Y" description splitting
-                                  (recursive — handles N-way chains, not just pairs);
+                                  (recursive — handles N-way chains, not just pairs;
+                                  borrows a trailing noun back when "и" elides it, e.g.
+                                  "Арендных и Коммунальных расходов"); strips a retained
+                                  "EBITDA ... как" preamble after a netting split;
                                   match_category_by_text (reclassification -> category)
     transaction_categorization.py  Block 3a: one LLM call/scenario, ledger -> category
     related_parties.py          KYC ownership % vs. threshold comparison — code, no LLM
-    reclassification_linking.py  Block 3a proper: audit findings -> ledger txn_id, by
-                                    counterparty+amount(+date) fuzzy match
+    reclassification_linking.py  Block 3a proper: audit/financial-notes findings ->
+                                    ledger txn_id, either directly (when the finding
+                                    states one) or by counterparty+amount(+date) fuzzy
+                                    match; three action shapes — recategorize,
+                                    exclude_from_period, no_change (informational only)
     fuzzy_match.py, dates.py     shared normalization/matching utilities
-    pipeline.py                   orchestrates the above into LinkedScenarioData
+    pipeline.py                   orchestrates the above into LinkedScenarioData —
+                                     also patches a dirty ledger row's amount by txn_id
+                                     (_apply_amount_corrections) before categorization
+                                     runs, and collects other_facts for calculation
   calculation/
-    formulas.py                 Block 3b: metric_type-branched arithmetic, no LLM at all
+    formulas.py                 Block 3b: metric_type-branched arithmetic, no LLM at
+                                   all; exclude_from_period drops a transaction from
+                                   every sum regardless of category; other_facts add
+                                   into a matching side via the same text-match
+                                   machinery reclassifications use
     evidence.py                  Block 3c: the counterfactual evidence test
     pipeline.py                   guarantees one CovenantResult per required cell,
                                      with an explicit, logged fallback on any failure
@@ -268,11 +311,20 @@ scripts/
   run_extraction.py          CLI for Block 2
   run_linking.py             CLI for Block 3a alone
   run_calculation.py          CLI for Block 3a+3b+3c (+ optional self-scoring)
+  (all three print a per-model LLM usage summary unconditionally at the end)
 tests/
-  test_resolution.py         Block 1, against the real dataset
+  test_resolution.py         Block 1, against the real dataset (includes the
+                                financial_notes/segment_linking regression tests)
+  test_accounts.py            the letter-spaced-ACC-token normalization, synthetic
+  test_segment_linking.py     the P5-shaped secondary linking mechanism, synthetic
+  test_template_validation.py submission_template.json structural validation
   test_extraction_pipeline.py Block 2 orchestration, mocked LLM calls
+  test_transaction_categorization.py  categorization prompt content (decoy guidance)
   test_linking_utils.py       Block 3a's non-LLM pieces, synthetic data
-  test_calculation.py          Block 3b/3c, synthetic data
+  test_linking_pipeline.py    Block 3a batch resilience + amount-correction patching
+  test_calculation.py          Block 3b/3c, synthetic data (incl. other_facts,
+                                  exclude_from_period, quarter-period inference)
+  test_llm_client.py          per-model usage accounting, mocked (no real API call)
 ```
 
 Planned remaining blocks (not yet built): Explanation (assembling the
@@ -446,11 +498,16 @@ shape + validating it against `submission_template.json`).
   (P7's). Both are gaps in the source data, not resolution bugs — Block 2
   needs to degrade gracefully (e.g. no related-party disclosures found ⇒
   can't positively identify any related party, not ⇒ crash).
-- **Multi-currency ledger, no rate found (yet).** Some scenario accounts
-  have EUR-denominated rows alongside USD ones, and no FX rate document has
-  turned up in the public dataset so far. Currency is preserved verbatim
-  per transaction; conversion is deliberately not implemented yet rather
-  than guessed at.
+- **Multi-currency ledger — a rate exists for exactly one scenario, found
+  late.** Some scenario accounts have EUR-denominated rows alongside USD
+  ones. Initially no FX rate document had turned up; later confirmed (after
+  the organizers stated in the hackathon chat that a rate does exist
+  somewhere in the files) that P3's own `financial_notes` document states
+  one, implied by a real settlement (72,146.75 EUR paid as $83,690.23).
+  Checked all 12 scenarios' own documents specifically for this — only P3
+  has one. Currency is preserved verbatim per transaction; conversion is
+  deliberately not implemented (P3's rate hasn't been applied yet either)
+  rather than guessed at for the other 11 scenarios with no rate source.
 
 ### Block 2 findings
 
@@ -549,19 +606,26 @@ shape + validating it against `submission_template.json`).
   only the two cases the case's own wording allows: a reclassification
   reversal, or a related-party inclusion/exclusion call. Both are
   *treatment* determinations; plain sum membership isn't.
-- **A defined financial term used without a local definition ("EBITDA",
-  bare) needs resolving into decomposed, summable components — and the
-  *shape* of the resolution matters as much as getting one at all.** Some
-  borrowers' agreements spell out "EBITDA (Выручка за вычетом
-  Операционных расходов)" inline; others just say "EBITDA" and rely on the
-  reader knowing the standard definition. The first fix (teach 2a to
-  resolve an undefined acronym to its standard meaning) wasn't sufficient
-  on its own — resolving it to "прибыль до вычета процентов, налогов,
-  износа и амортизации" (earnings before interest/tax/D&A, the textbook
-  phrasing) is *correct* but useless downstream, because no ledger
-  transaction is literally "earnings before X". It has to resolve to the
-  decomposed form ("revenue minus operating expenses") that names concrete
-  things a transaction can actually be.
+- **"EBITDA" used without a local definition splits into two genuinely
+  different situations, confirmed by reading the source credit agreements
+  directly — only one of them is safe to fix in code.** Some borrowers'
+  agreements spell it out inline ("EBITDA (Выручка за вычетом
+  Операционных расходов)" — P5); the *shape* of resolving that mattered as
+  much as resolving it at all — the transaction classifier was finding
+  zero matches until `_split_compound`'s output stopped retaining the
+  "EBITDA ... как" preamble as part of the category label (fixed:
+  `_strip_defined_as_prefix`, confirmed via `match_category_by_text` no
+  longer needing to match against a polluted label). Other borrowers'
+  agreements (P3, P7) just say "EBITDA" with **no definition anywhere in
+  the document at all** — confirmed by grepping the full agreement text,
+  not assumed. Ground truth confirms a real number was expected there
+  (P3's actual=1.71), meaning some standard-definition fallback is
+  probably the intended answer — but deliberately **not implemented**:
+  auto-substituting a textbook EBITDA formula the source document never
+  states is arguably the model contributing outside knowledge rather than
+  extracting a fact, which cuts close to the case's core "LLM extracts,
+  code decides" rule. Flagged for a separate, careful discussion before
+  ever touching it, not silently fixed.
 - **LLM categorization non-determinism is large enough to dominate the
   self-score, not just add noise around the edges.** Two runs against
   identical code and prompts scored 0.61 and 0.50 on the public dataset.
@@ -578,6 +642,77 @@ shape + validating it against `submission_template.json`).
   real development time before being identified — see "Known sources of
   instability" above.
 
+### Block 3 findings — the `financial_notes` discovery (2026-08-08, later session)
+
+The single largest finding of the project, found by chasing an
+organizer-confirmed hint ("the FX rate is in the files") with the same
+method as everything else here — read the actual documents, don't reason
+abstractly — rather than assuming it was already ruled out.
+
+- **A PDF letter-spacing rendering artifact hid one entire document kind
+  for all 12 scenarios simultaneously.** Each scenario has its own
+  "Примечания к финансовой отчётности" (Notes to Financial Statements) —
+  an audit-firm-issued document with the *same* "ДОПОЛНЕНИЕ О СОБЛЮДЕНИИ
+  КОВЕНАНТОВ" section shape as a standalone audit report. Its account
+  number renders as `A C C - 7 8 0 3` (a space between every character —
+  the same class of artifact already documented for stylized headers like
+  "Д О ГО В О Р", but never applied to `accounts.py`'s regex match).
+  `ACCOUNT_TOKEN_RE`'s exact `\bACC-\d+\b` match can't see through that,
+  so all 12 of these documents sat in `unmatched_documents`, completely
+  invisible, for the entire project until this was found. Fixed by
+  normalizing whitespace out of an `"A C C - ..."`-shaped span *before*
+  the same exact-token regex runs — not a new or looser matching
+  mechanism, a repaired input to the existing one (`accounts.py`'s
+  `_normalize_spaced_account_tokens`).
+- **What was hiding inside, once found:** P8's true amount for its
+  dirty ledger row (`TXN-P8-0031` → $884,204.16) *and* an off-ledger
+  severance obligation ($918,447.52) — both needed for 6.1, both in one
+  document; P3's FX settlement rate; P7's own treasury memo similarly held
+  `TXN-P7-0033`'s true amount; B4/P1's findings that a specific transaction
+  should be excluded from the covenant period entirely (not
+  recategorized — a genuinely new finding *shape*, "исключена из
+  ковенантного периода"); P10/P2's ordinary reclassifications. Confirmed
+  with the strongest evidence available short of the actual answer key:
+  P8's 6.1, computed with all of the above wired in, came out
+  **actual=4,221,314.95 / BREACH — bit-exact against `ground_truth.json`**
+  (`2,418,663.27` real payroll txn + `884,204.16` patched txn +
+  `918,447.52` severance fact, exactly).
+- **One related but separate document was found the same evening by a
+  different route: P5's Group-parent consolidated report** (Sarybel
+  Energy Holding JSC — English-language, a different legal entity from
+  the borrower). Not an ACC-token case at all — a Group-parent report
+  will never mention the subsidiary's own account number. Deliberately
+  **not** generalized into a company-name similarity matcher (this
+  dataset has a confirmed, deliberate near-duplicate-entity-name trap —
+  see `accounts.py`'s decoy-subaccount docstring). Fixed narrowly instead:
+  an exact match of the scenario's own *already-verified* borrower name
+  (from its own ACC-matched credit agreement, never guessed from the
+  candidate document's own name) next to explicit "this document names
+  the borrower as its own subsidiary/segment" language
+  (`segment_linking.py`). A real, confirmed false-positive source was
+  caught and excluded before this shipped: "Kazakhstan JSC", a fragment
+  of every document's "Halyk Bank of Kazakhstan JSC" letterhead, extracted
+  by the same best-effort company-name regex as every real borrower name —
+  trusting it would have made the matcher fire near-universally.
+- **Extracting the facts wasn't enough on its own — a whole class of
+  "extracted but never consumed" fact existed and had to be wired into
+  `calculation/` by shape, not by scenario.** Three genuinely different
+  shapes, one underlying mechanism each: a plain off-ledger figure adds
+  into a matching covenant side's sum via the same `match_category_by_text`
+  stem-overlap machinery reclassifications already used
+  (`AuditExtractionResult.other_facts`); a dirty-row correction patches
+  `Transaction.amount` by `txn_id` *before* categorization ever runs, not
+  after (`_apply_amount_corrections`, logged explicitly per patch); a
+  period-exclusion finding is a new `AuditReclassification.action` value
+  (`"exclude_from_period"`, alongside the original `"recategorize"` and a
+  new `"no_change"` for a reclassification explicitly considered and
+  rejected — must never be treated as a real one). All three routed
+  through `extract_audit_facts` — the *same* extractor and schema
+  `audit_report` already used, extended with two new list fields, not a
+  parallel pipeline — since `financial_notes` and `treasury_memo` turned
+  out to mix all three finding shapes in one document exactly like a
+  standalone audit report does.
+
 ## Code review: places that could fail the same way the epsilon bug did
 
 Requested explicitly after the epsilon bug was found and fixed: a pass over
@@ -585,44 +720,57 @@ Requested explicitly after the epsilon bug was found and fixed: a pass over
 divisions that could produce a confidently-wrong answer instead of a loud
 failure — specifically ones that haven't shown up yet because the public
 dataset hasn't happened to trigger them, not because they're provably safe.
-Findings only, not fixed yet — risk-rated for triage.
+Risk-rated for triage. **Findings 1–4 (High) are now fixed**, each with its
+own offline test — see the fix descriptions inline below; 5–12
+(Medium/Low) are still open findings, not fixes, by explicit instruction
+not to keep tuning defaults on a small sample. A second wave of findings
+from a later session (the `financial_notes` discovery) is appended after
+this original list.
 
-**High — these can lose real, already-paid-for work or silently zero out
-the whole submission:**
+**High — fixed:**
 
 1. **No per-scenario exception isolation in Block 2 (`extraction/pipeline.py`)
-   or Block 3a (`linking/pipeline.py`).** `extraction/pipeline.py` catches
-   only `ExtractionError` around each of its four extraction calls; any
-   other exception (a pydantic quirk, an unanticipated SDK exception type,
-   a bug in our own matching code) propagates uncaught through the entire
-   `extract_all_facts` loop, aborting all 12 scenarios at once —
-   `linking/pipeline.py`'s call to `categorize_transactions` isn't wrapped
-   in *any* try/except, so it's even more exposed. This is not
+   or Block 3a (`linking/pipeline.py`) — fixed.** `extraction/pipeline.py`
+   used to catch only `ExtractionError` around each of its four extraction
+   calls; any other exception (a pydantic quirk, an unanticipated SDK
+   exception type, a bug in our own matching code) propagated uncaught
+   through the entire `extract_all_facts` loop, aborting all 12 scenarios
+   at once — `linking/pipeline.py`'s call to `categorize_transactions`
+   wasn't wrapped in *any* try/except, so it was even more exposed. Not
    hypothetical: an `openai.APIConnectionError` did exactly this before it
-   was added to the retry list (see "Design decisions" above), and nothing
-   guarantees it's the last exception type we haven't anticipated.
-2. **No incremental checkpointing.** `save_scenario_facts` (Block 2) is
-   called once, after the full 12-scenario loop completes; Block 3a has no
-   save/cache mechanism at all. Combined with finding #1: a crash on
-   scenario 9 of 12 loses scenarios 1–8's real, paid-for API calls, not
-   just scenario 9's. Directly answers "can I restart from the middle?"
-   above — no, not yet.
+   was added to the retry list (see "Design decisions" above). Both loops
+   now catch `Exception` per-scenario, log clearly, degrade to an
+   empty/safe result for that scenario, and continue — see
+   `test_extraction_pipeline.py`'s `ExtractAllFactsBatchResilienceTest` and
+   `test_linking_pipeline.py`.
+2. **No incremental checkpointing — fixed.** `save_scenario_facts` (Block 2)
+   used to be called once, after the full 12-scenario loop completed;
+   Block 3a had no save/cache mechanism at all. Combined with finding #1: a
+   crash on scenario 9 of 12 lost scenarios 1–8's real, paid-for API calls,
+   not just scenario 9's. Now saves after *every* scenario, not once at
+   the end — `test_progress_is_saved_after_every_scenario_not_once_at_the_end`.
 3. **Silent zero for `aggregate_amount`/`max_single_component`/`other`
-   when categorization finds nothing.** The `InsufficientDataError` fix
-   only covers `ratio` denominators. The other three metric types get a
-   plain `actual=0.0` on zero matched transactions with no signal at all —
-   and unlike the ratio case, `0.0` doesn't look obviously wrong: it reads
-   as a perfectly plausible "no capex this year" / "no overhead this
-   quarter" answer, for a max-direction covenant that's `COMPLIANT`. This
-   is the *same underlying bug class* as the epsilon fallback, just harder
-   to catch by inspection because it doesn't produce an absurd number.
-4. **`ingestion/template.py`'s `template.get("answers", {})` has no
-   structural validation.** If the private dataset's
-   `submission_template.json` has even a slightly different top-level
-   shape, `required_scenario_ids` silently returns `[]`, and the entire
-   pipeline processes zero scenarios with no exception anywhere — the
-   failure would only become visible at the very end, looking at an empty
-   result, with the least time available to react.
+   when categorization finds nothing — fixed.** The `InsufficientDataError`
+   fix originally only covered `ratio` denominators. The other three
+   metric types used to get a plain `actual=0.0` on zero matched
+   transactions with no signal at all — and unlike the ratio case, `0.0`
+   didn't look obviously wrong: it read as a perfectly plausible "no capex
+   this year" / "no overhead this quarter" answer, for a max-direction
+   covenant that's `COMPLIANT`. Same underlying bug class as the epsilon
+   fallback, just harder to catch by inspection because it didn't produce
+   an absurd number. Now raises the same `InsufficientDataError` for all
+   four metric types — `test_aggregate_amount_zero_matches_raises_insufficient_data`,
+   `test_max_single_component_all_zero_raises_insufficient_data`.
+4. **`ingestion/template.py`'s `template.get("answers", {})` had no
+   structural validation — fixed.** If the private dataset's
+   `submission_template.json` had even a slightly different top-level
+   shape, `required_scenario_ids` would silently return `[]`, and the
+   entire pipeline would process zero scenarios with no exception
+   anywhere — the failure would only become visible at the very end,
+   looking at an empty result, with the least time available to react.
+   `load_template` now validates structure explicitly and raises
+   `TemplateValidationError` with a message naming the missing piece — see
+   `test_template_validation.py`.
 
 **Medium — narrower or lower-probability, worth knowing about:**
 
@@ -640,11 +788,15 @@ the whole submission:**
    from one confirmed false-positive (`"расходы"` in `"Процентные
    расходы"`) — it may not cover whatever generic financial vocabulary the
    private dataset's reclassification reports happen to use.
-7. **`in_period` silently assumes the full year when 2a fails to extract
-   a period at all** (both `period_start` and `period_end` null). A
-   reasonable default, but not logged — if a private-dataset covenant is
-   genuinely period-scoped and extraction missed it, there's no signal
-   that the assumption fired.
+7. **`in_period` silently assumes no lower bound when 2a fails to extract
+   an explicit `period_start` and nothing can be inferred** (see
+   `_effective_period_start` for the one case it *can* now infer — "N-й
+   квартал, оканчивающийся ДАТА" — added after B4's Q4-only revenue test
+   was found silently summing the whole year; confirmed necessary, see
+   Block 3 findings below). Outside that one recognized shape, the
+   assumption is still silent and unlogged — if a private-dataset covenant
+   is genuinely period-scoped in some other phrasing extraction missed,
+   there's no signal that the "no lower bound" default fired.
 8. **`FALLBACK_STATUS = "COMPLIANT"` is a documented coin-flip, not a
    considered guess — worth remembering it's a strategic choice, not a
    neutral one.** If the private dataset's true status distribution skews
@@ -688,6 +840,62 @@ the whole submission:**
     a non-negative amount** (`if txn.amount >= 0: continue`), even to a
     known related party — correct under the ledger's stated sign
     convention, but undefended against a data-entry sign anomaly.
+
+### Second wave — the `financial_notes` discovery (2026-08-08, later session)
+
+Found while chasing a genuinely different question — the organizers
+confirmed in the hackathon chat that a FX conversion rate *does* exist
+somewhere in the dataset — using the same method as everything else in
+this section: read the actual files, don't reason abstractly. See
+"Findings" below for the full story (a PDF letter-spacing artifact hid a
+whole undiscovered document kind for all 12 scenarios at once). Findings
+from wiring the newly-discovered documents' facts into calculation:
+
+13. **`other_facts` matching is scenario-wide, not exclusivity-checked
+    across covenants.** `_resolve_side_sum` matches every one of a
+    scenario's `other_facts` against every covenant/role it's asked to
+    resolve, independently each time — there's no check that a given fact
+    is claimed by at most one covenant side scenario-wide. Confirmed safe
+    on the one real case exercised so far (P8's severance fact only
+    clears `match_category_by_text`'s threshold against 6.1's own
+    category, verified by hand) but not defended against a private-dataset
+    fact whose vocabulary happens to overlap two different covenants'
+    descriptions — it would silently double-count into both.
+14. **`other_facts` are only wired into `_resolve_side_sum`, not
+    `max_single_component`'s per-component sums.** `compute_metric`'s
+    `max_single_component` branch calls `_category_signed_sum` directly,
+    bypassing `_resolve_side_sum` entirely — an off-ledger fact that
+    should count toward one named component of a max-single-component
+    test (B1/P10's "Individual Overhead Line Ceiling" shape) currently
+    can't reach it. Not confirmed as a live gap on the public dataset (no
+    max_single_component covenant has needed an other_fact so far), but a
+    known, undefended gap in coverage.
+15. **FX conversion is scoped to P3 only, deliberately, not implemented
+    generally.** Re-checked all 12 scenarios' own `financial_notes`
+    documents for an FX rate disclosure (not just P3's) — only P3's has
+    one (`Примечание 9`, the Rheinland Katalyse Service GmbH settlement:
+    72,146.75 EUR → $83,690.23). The other 11 scenarios' EUR-denominated
+    ledger rows (1–3 each, mostly decoy-flavored by description) have no
+    disclosed rate anywhere in their own documents — non-USD transactions
+    are still filtered out entirely (`test_non_usd_transactions_excluded`),
+    not converted, and that remains the right call for every scenario
+    except possibly P3, where a rate now exists but hasn't been applied.
+16. **P8's covenant 6.3 still falls back** (`ratio denominator matched 0
+    transactions` — the revenue category, not anything this session
+    touched) even after the `financial_notes` fix resolved 6.1 to a
+    bit-exact ground-truth match. Confirms the `financial_notes` fix and
+    the categorization-noise problem are separate issues, not the same
+    one — fixing document linking didn't and wasn't expected to fix
+    transaction-categorization misses.
+17. **Two designed-but-not-yet-built extensions, flagged so they aren't
+    silently assumed done:** "Unrestricted Subsidiary" style covenants
+    (P9's 6.1 — a KYC/ownership-style question phrased without any of
+    `is_related_party_text`'s trigger words, so it's currently routed to
+    the ordinary transaction classifier instead of a related-party-style
+    resolution) and springing/conditional covenants (P3's 6.1 — "applies
+    only if financing proceeds exceed $X", which `CovenantClause` has no
+    field to represent, so it's always evaluated unconditionally). Design
+    docs for both, not implementations, are below.
 
 ## Draft design: rule-based pre-filter for transaction categorization (not implemented)
 
@@ -826,6 +1034,141 @@ mostly-easy transaction mix, where voting amplified conservative bias on
 easy cases; voting on a residual that's ambiguous *by construction* might
 behave differently, but that's a hypothesis for after this ships, not
 part of this design.
+
+## Draft design: "Unrestricted Subsidiary" routing (Task B — not implemented)
+
+Design only, per explicit instruction to get this approved before writing
+any code. P9's covenant 6.1 ("Максимальная доля активов, переданных
+неограниченным дочерним организациям") caps the value of capital assets
+transferred to "Unrestricted Subsidiaries" at 0.15x of total capex. The
+numerator names a specific counterparty-identity question — *which*
+counterparties are designated Unrestricted Subsidiaries — but
+`is_related_party_text()`'s trigger regex (`связанн|аффилиров|related.?
+part|affiliat`) doesn't match "дочерним" at all, confirmed by direct test
+(`is_related_party_text(...)` on the real numerator text returns `False`).
+So this currently routes to the ordinary transaction-description
+classifier instead of any identity-based resolution — structurally the
+wrong tool, since no ledger row's free-text description would ever say
+"transferred to an Unrestricted Subsidiary".
+
+**A checked assumption changes the recommendation here.** The obvious fix
+looked like "add a `дочерн`-style trigger and a new
+`resolve_unrestricted_subsidiaries()` mirroring `related_parties.py`'s
+shape." Before designing that, checked whether *any* document in P9's
+corpus (KYC dossier, `financial_notes`, credit agreement — all three, full
+text) actually discloses which counterparty, if any, carries the
+"Unrestricted Subsidiary" designation. **None does.** The term appears
+exactly three times in the whole corpus, all three inside the credit
+agreement's own covenant-clause *definition* of the concept — never as an
+actual disclosure naming a real entity. This is a materially different
+situation from related-party resolution, where every scenario's KYC
+dossier (when one exists) *does* carry a real ownership table to compare
+against a threshold.
+
+**Two options, ranked by how well-supported they are by actual data:**
+
+1. **Recommended for now — extend the existing zero-exemption, don't build
+   a parallel resolution mechanism.** `InsufficientDataError`'s
+   related-party exemption already encodes the principle "a genuine zero
+   for an identity-based side is a normal business fact, not a
+   categorization miss, when we have no positive evidence otherwise" (see
+   `_needs_data_check`). Recognizing "Unrestricted Subsidiary"-flavored
+   text (a narrow, specific phrase match — not broadening
+   `is_related_party_text` itself, which would risk misrouting unrelated
+   "дочерн" mentions elsewhere in the private dataset) as exempt the same
+   way gets the *currently correct* answer (a numerator of 0.0, since
+   nothing discloses a transfer to any such entity, is `COMPLIANT` against
+   a 0.15x cap) without inventing a resolution path that has zero real
+   examples to validate against. Small, safe, matches the same logging
+   discipline as the existing exemption (`calculation_notes` states
+   plainly that this is an absence-of-disclosure zero, not a confirmed
+   one — the same honesty gap already flagged for the KYC case, finding
+   #9 above, applies here too and should reuse the same framing).
+2. **If the private dataset actually discloses Unrestricted Subsidiary
+   designations somewhere** (a KYC dossier field, a credit-agreement
+   schedule, anything) — build the fuller mechanism: extend
+   `RelatedPartyDisclosure` (or a sibling schema) with an
+   `explicitly_labeled_unrestricted_subsidiary: bool` field (mirroring
+   `explicitly_labeled_related_party`'s "literal reading of the source
+   text, never a computed judgment" pattern), add a narrow
+   `is_unrestricted_subsidiary_text()` matcher (specific to "неограниченн
+   ... дочерн" / "unrestricted subsidiar", not a bare "дочерн" check), and
+   a `resolve_unrestricted_subsidiaries()` resolution function alongside
+   `related_parties.py`. Only worth building once there's a real
+   disclosure to extract and test against — building it against zero
+   examples risks the same kind of untested-assumption bug this project
+   has twice found the hard way this session (epsilon bug, ACC-token
+   letter-spacing).
+
+**Recommendation: do option 1 now (cheap, safe, matches current data);
+revisit option 2 only if a private-dataset document actually discloses
+this, using the same "read the files first" discipline that found the
+`financial_notes` documents.**
+
+## Draft design: springing/conditional covenants (Task C — not implemented)
+
+Design only, same reasoning: get this approved before writing code. P3's
+covenant 6.1 ("Springing Drawdown Leverage Test") states the ratio test
+"применяется... только при условии, что совокупные поступления по
+финансированию превышают $4,000,000.00" — the covenant only binds if a
+condition (itself a computable aggregate-amount test) is met.
+`CovenantClause` has no field to represent this at all, so the pipeline
+always evaluates the ratio unconditionally. Not currently a confirmed
+self-score error (P3's own condition happens to be met — its financing
+proceeds do exceed $4M, so the covenant applies and the unconditional
+evaluation gives the right answer by coincidence of this particular
+scenario), but a real schema-completeness gap: a private-dataset scenario
+whose condition genuinely *isn't* met would still get evaluated as if it
+always applies.
+
+**Proposed schema extension** — the condition itself has the same shape as
+a covenant's own test (a description, a threshold, a direction), so
+reuse that shape rather than inventing a new one:
+
+```python
+class CovenantClause(BaseModel):
+    ...
+    applicability_condition_description: Optional[str] = Field(
+        description="If this covenant only applies when some other "
+        "condition is met (a 'springing' covenant), describe that "
+        "condition's own measurable test here, in the source language "
+        "(e.g. 'совокупные поступления по финансированию'). Null if the "
+        "covenant applies unconditionally — the normal case."
+    )
+    applicability_condition_threshold: Optional[float] = ...
+    applicability_condition_direction: Optional[Literal["max", "min"]] = ...
+```
+
+Extraction (2a) fills these from the source text exactly like the main
+threshold/direction fields — pure extraction, no judgment about whether
+the condition is *currently* met (that's computed from the ledger, in
+code, same as everything else).
+
+**Proposed calculation flow** — in `compute_metric` or a thin wrapper
+around it: if `applicability_condition_description` is set, run the
+*same* `aggregate_amount`-style resolution (`_resolve_side_sum`) against
+it first, compare to `applicability_condition_threshold` via the same
+`compare_to_threshold` logic already used for the main test, and only
+evaluate/report the main ratio if the condition says the covenant
+applies.
+
+**The genuinely open design question: what does a non-applicable covenant
+report as `status`?** `submission_template.json`/`ground_truth.json` only
+ever show `COMPLIANT`/`BREACH`, no "not applicable" option, and there's no
+confirmed real example (in the public dataset) of a springing covenant
+whose condition isn't met to check against. Leaning `COMPLIANT` (a
+covenant that doesn't bind can't be breached) with an explicit
+`calculation_notes` entry stating the condition wasn't met and why — the
+same transparent-fallback discipline as `FALLBACK_STATUS`, not a silent
+guess — but this is exactly the kind of assumption worth confirming
+before implementing, not after.
+
+**Cost/benefit honestly:** moderate implementation cost (a second
+`compute_metric`-shaped evaluation per springing covenant), for a shape
+confirmed exactly once in 12 public scenarios (P3 only), with the
+riskiest part (the non-applicable-status question) unvalidatable against
+any real example either way. Worth doing if time allows post-submission-
+critical-path work; not worth displacing higher-confidence fixes for.
 
 ## LLM provider portability — what it'd take to switch off OpenAI
 
