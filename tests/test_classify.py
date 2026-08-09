@@ -38,5 +38,70 @@ class ClassifyKindTest(unittest.TestCase):
         self.assertGreaterEqual(score, 1)
 
 
+class TemplateVariationRobustnessTest(unittest.TestCase):
+    """Organizers confirmed (2026-08-09) the private dataset uses multiple
+    financial-report templates — a title synonym must not repeat Sarybel's
+    pre-fix letter-spacing failure mode (whole document kind scores 0,
+    falls through to "other", invisible downstream).
+    """
+
+    def test_financial_notes_title_synonyms(self) -> None:
+        for phrase in (
+            "Пояснения к финансовой отчётности за 2025 год",
+            "Финансовые примечания. Компания раскрывает следующую информацию.",
+            "Пояснительная записка к отчётности заёмщика",
+        ):
+            with self.subTest(phrase=phrase):
+                kind, score = classify_kind(phrase)
+                self.assertEqual(kind, "financial_notes")
+                self.assertGreaterEqual(score, 1)
+
+    def test_numbered_notes_alone_classifies_as_financial_notes(self) -> None:
+        # No title marker at all — a "Consolidated Financial Statements"
+        # style title (real Sarybel shape) that none of the literal
+        # markers would catch, but the body has the numbered-note
+        # structure real financial_notes documents consistently have.
+        text = (
+            "Sarybel Energy Holding JSC Consolidated Financial Statements\n\n"
+            "Note 1 — Basis of preparation\n...\n"
+            "Note 2 — Summary of accounting policies\n...\n"
+            "Note 9 — Related party transactions\n..."
+        )
+        kind, score = classify_kind(text)
+        self.assertEqual(kind, "financial_notes")
+
+    def test_single_numbered_note_does_not_trigger_structural_marker(self) -> None:
+        # Only one numbered note — below the 2-distinct threshold, and no
+        # title marker either — must stay "other", not a false positive.
+        text = "Some memo. See Note 1 for details."
+        kind, score = classify_kind(text)
+        self.assertEqual(kind, "other")
+
+    def test_numbered_notes_do_not_override_a_stronger_credit_agreement_match(self) -> None:
+        # A credit agreement that happens to reference "Примечание 1" and
+        # "Примечание 2" in passing must not get outscored into
+        # financial_notes if its own markers score higher.
+        text = (
+            "Договор банковского займа. Заёмщик обязуется перед Кредитором. "
+            "Финансовые ковенанты изложены в Приложении. "
+            "См. также Примечание 1 и Примечание 2 к настоящему договору."
+        )
+        kind, score = classify_kind(text)
+        self.assertEqual(kind, "credit_agreement")
+
+    def test_other_kind_title_synonyms(self) -> None:
+        cases = {
+            "credit_agreement": "Кредитный договор между Банком и Заёмщиком",
+            "kyc_dossier": "Идентификация клиента. Досье по проверке контрагента.",
+            "audit_report": "Аудиторское заключение независимого аудитора",
+            "treasury_memo": "Меморандум казначейства по итогам квартала",
+        }
+        for expected_kind, phrase in cases.items():
+            with self.subTest(kind=expected_kind):
+                kind, score = classify_kind(phrase)
+                self.assertEqual(kind, expected_kind)
+                self.assertGreaterEqual(score, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

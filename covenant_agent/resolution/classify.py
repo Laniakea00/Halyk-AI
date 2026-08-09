@@ -20,6 +20,8 @@ recognize.
 
 from __future__ import annotations
 
+import re
+
 # kind -> marker phrases (checked case-insensitively as substrings).
 # Phrases are function-describing, not company-specific, by design.
 KIND_MARKERS: dict[str, tuple[str, ...]] = {
@@ -48,6 +50,14 @@ KIND_MARKERS: dict[str, tuple[str, ...]] = {
         # dataset, same reasoning as the H1-H3/M1/M4 hardening pass.
         "қаржылық есептілік",  # financial statements/reporting
         "табыс",  # income/revenue
+        # Template-variation hardening (2026-08-09): organizers confirmed
+        # the private dataset uses multiple financial-report templates —
+        # a title synonym here is the exact same failure shape as
+        # Sarybel's pre-fix letter-spacing artifact (whole document kind
+        # scores 0, falls through to "other", invisible downstream).
+        "пояснения к финансовой отчётности",
+        "финансовые примечания",
+        "пояснительная записка к отчётности",
     ),
     "credit_agreement": (
         "договор банковского займа",
@@ -58,6 +68,9 @@ KIND_MARKERS: dict[str, tuple[str, ...]] = {
         "несиелік келісім",  # credit/loan agreement (kk)
         "шарт",  # agreement/contract (kk)
         "міндеттемелер",  # obligations/liabilities (kk)
+        # Template-variation hardening (2026-08-09) — see financial_notes.
+        "кредитный договор",
+        "договор о предоставлении кредита",
     ),
     "kyc_dossier": (
         "знай своего клиент",
@@ -65,6 +78,9 @@ KIND_MARKERS: dict[str, tuple[str, ...]] = {
         "надлежащая проверка клиента",
         "kyc",
         "связанных сторон",
+        # Template-variation hardening (2026-08-09) — see financial_notes.
+        "идентификация клиента",
+        "проверка контрагента",
     ),
     "audit_report": (
         "отчёт о выполнении согласованных процедур",
@@ -72,15 +88,40 @@ KIND_MARKERS: dict[str, tuple[str, ...]] = {
         "registered auditors",
         "аудитор",
         "переклассифиц",
+        # Template-variation hardening (2026-08-09) — see financial_notes.
+        "аудиторское заключение",
+        "независимый аудитор",
     ),
     "treasury_memo": (
         "служебная записка казначейства",
         "казначейство группы",
         "операционное досье на конец периода",
+        # Template-variation hardening (2026-08-09) — see financial_notes.
+        "меморандум казначейства",
+        "казначейская записка",
     ),
 }
 
 MIN_SCORE_TO_CLASSIFY = 1
+
+# Template-variation hardening (2026-08-09): "Примечание N"/"Note N"
+# numbering is a far more stable structural convention across different
+# financial-report templates than the exact title phrase — confirmed on
+# the public dataset: all 12 real financial_notes documents have 6-9
+# distinct numbered notes; grepped the other ~190 documents in the corpus
+# for the same pattern and found zero false positives (the one 2+ hit
+# outside financial_notes is Sarybel's own Group-parent consolidated
+# statements, which is correctly re-routed to "group_financials" by
+# segment_linking.py regardless of what classify_kind gives it here — see
+# resolution/pipeline.py's secondary linking pass, which keys off "no
+# account-token match at all", not off `kind`). Scoped to financial_notes
+# only — not extended to other kinds without the same real-data check.
+_NUMBERED_NOTE_RE = re.compile(r"\b(?:примечание|note)\s*№?\s*(\d+)", re.IGNORECASE)
+_NUMBERED_NOTE_MIN_DISTINCT = 2
+
+
+def _has_numbered_notes_structure(text: str) -> bool:
+    return len({m for m in _NUMBERED_NOTE_RE.findall(text)}) >= _NUMBERED_NOTE_MIN_DISTINCT
 
 
 def classify_kind(text: str) -> tuple[str, int]:
@@ -90,6 +131,8 @@ def classify_kind(text: str) -> tuple[str, int]:
     best_score = 0
     for kind, markers in KIND_MARKERS.items():
         score = sum(1 for marker in markers if marker in lowered)
+        if kind == "financial_notes" and _has_numbered_notes_structure(text):
+            score += 1
         if score > best_score:
             best_kind, best_score = kind, score
     if best_score < MIN_SCORE_TO_CLASSIFY:
