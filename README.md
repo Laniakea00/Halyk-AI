@@ -998,6 +998,29 @@ transcript; summarized findings and what got fixed:
   is more complete, or that the public dataset's ground truth relies on
   information genuinely outside the provided corpus for these two cells
   specifically.
+- **P9 6.1 — same class of open question, checked and confirmed
+  (2026-08-09).** The "Unrestricted Subsidiary" covenant's own text names
+  its source of truth explicitly: a transfer only counts if the receiving
+  subsidiary has "Unrestricted" status, "согласно досье идентификации
+  клиента" (per the KYC dossier); a transfer to a subsidiary that keeps
+  "Restricted" status is excluded from the calculation entirely
+  (`carve_outs`, still not applied — see Idea 2 above). Ground truth's
+  evidence_txn_id (`TXN-P9-0025`) implies exactly one of two similarly-worded
+  transfer transactions (`TXN-P9-0025` "Zhezkazgan Processing Holdings
+  LLP" counted, `TXN-P9-0017` "Zhezkazgan Conveyor Assets LLP" excluded)
+  should count — but P9's KYC dossier discloses only related-party
+  ownership percentages for three *entirely different* counterparties
+  (Kazakhmys Smelting JSC, Ulytau Capital LLP, Ural Haul Systems LLP); grepped
+  every cached document in the full 200-file corpus for either subsidiary's
+  exact name — zero hits anywhere. The Unrestricted/Restricted designation
+  the covenant's own carve-out depends on is never actually disclosed for
+  either specific counterparty in any document our pipeline reads. No code
+  fix is possible without either guessing (violates this project's core
+  no-fabrication rule) or hardcoding this scenario's specific txn_ids
+  (violates the project's own "never hardcode scenario-specific values"
+  rule from day one, and wouldn't generalize to the private dataset's
+  different borrowers regardless). Left undone, deliberately, same as P2
+  6.3/P6 6.1 above.
 
 ## Draft design: rule-based pre-filter for transaction categorization (not implemented)
 
