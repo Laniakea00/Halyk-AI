@@ -22,7 +22,14 @@ logger = logging.getLogger(__name__)
 
 # "TXN-<scenario_id>-<sequence>" — scenario_id is alnum (e.g. "P1", "B4",
 # but also plain-numeric noise accounts like "9001"); sequence is digits.
-TXN_ID_RE = re.compile(r"^TXN-(?P<scenario>[A-Za-z0-9]+)-(?P<seq>\d+)$")
+# Private dataset (2026-08-09): scenario KC uses an extra category segment
+# per row (e.g. "TXN-KC-CAP-29", "TXN-KC-FIN-19" — CAP/FIN/REV/OPX/CON/MKT),
+# so the trailing "-<seq>" is no longer always the token right after the
+# scenario id. The optional "(?:-[A-Za-z]+)*" absorbs zero or more such
+# alpha category segments before the final numeric sequence; confirmed on
+# real data to leave every previously-matching shape (including the
+# plain-numeric "TXN-9170-0002" noise-account ids) unchanged.
+TXN_ID_RE = re.compile(r"^TXN-(?P<scenario>[A-Za-z0-9]+)(?:-[A-Za-z]+)*-(?P<seq>\d+)$")
 
 
 _THOUSANDS_GROUP_RE = re.compile(r"^-?\d{1,3}(,\d{3})+$")

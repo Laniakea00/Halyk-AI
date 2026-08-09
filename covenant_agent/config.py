@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Default dataset location. Overridable via CLI flags in scripts/*.py so the
 # same code runs unmodified against the private dataset on the day.
-DEFAULT_DATA_DIR = REPO_ROOT / "agentic-bank-public"
+DEFAULT_DATA_DIR = REPO_ROOT / "agentic-bank-hidden"
 DEFAULT_CACHE_DIR = REPO_ROOT / "cache"
 
 LEDGER_FILENAME = "master_ledger_2025.csv"

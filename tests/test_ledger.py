@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from covenant_agent.ingestion.ledger import _normalize_amount_string, _parse_amount, load_ledger
+from covenant_agent.ingestion.ledger import TXN_ID_RE, _normalize_amount_string, _parse_amount, load_ledger
 
 CSV_HEADER = "txn_id,date,account_id,scenario_id,counterparty,description,amount,currency\n"
 
@@ -46,6 +46,56 @@ class NormalizeAmountStringTest(unittest.TestCase):
 
     def test_parse_amount_still_returns_none_for_genuinely_unparseable(self) -> None:
         self.assertIsNone(_parse_amount("not-a-number", "T1"))
+
+
+class TxnIdCategorySegmentTest(unittest.TestCase):
+    """Private dataset (2026-08-09): scenario KC's rows use an extra alpha
+    category segment before the sequence number (e.g. "TXN-KC-CAP-29"),
+    which the original "TXN-<scenario>-<digits>" regex rejected outright —
+    silently dropping every KC row and crashing derive_scenario_accounts
+    with "0 accounts". Confirmed live against the real private ledger.
+    """
+
+    def test_category_segmented_ids_parse_with_correct_scenario_and_seq(self) -> None:
+        for txn_id, expected_scenario, expected_seq in (
+            ("TXN-KC-CAP-29", "KC", "29"),
+            ("TXN-KC-FIN-19", "KC", "19"),
+            ("TXN-KC-REV-52", "KC", "52"),
+            ("TXN-KC-CON-42", "KC", "42"),
+            ("TXN-KC-MKT-08", "KC", "08"),
+        ):
+            with self.subTest(txn_id=txn_id):
+                match = TXN_ID_RE.match(txn_id)
+                self.assertIsNotNone(match)
+                self.assertEqual(match.group("scenario"), expected_scenario)
+                self.assertEqual(match.group("seq"), expected_seq)
+
+    def test_plain_scenario_ids_still_parse_unchanged(self) -> None:
+        # Regression guard: the public dataset's plain "TXN-<scenario>-<seq>"
+        # shape, and the noise-account "TXN-<digits>-<seq>" shape, must never
+        # be affected by the new optional category-segment group.
+        for txn_id, expected_scenario, expected_seq in (
+            ("TXN-J3-0035", "J3", "0035"),
+            ("TXN-X1-0065", "X1", "0065"),
+            ("TXN-9170-0002", "9170", "0002"),
+            ("TXN-P1-0001", "P1", "0001"),
+        ):
+            with self.subTest(txn_id=txn_id):
+                match = TXN_ID_RE.match(txn_id)
+                self.assertIsNotNone(match)
+                self.assertEqual(match.group("scenario"), expected_scenario)
+                self.assertEqual(match.group("seq"), expected_seq)
+
+    def test_load_ledger_end_to_end_with_category_segment(self) -> None:
+        body = (
+            "TXN-KC-CAP-29,2025-01-09,TELE-4471,KC,Vendor,description,-100.00,USD\n"
+        ).encode("utf-8")
+        with TemporaryDirectory() as tmp:
+            path = _write_ledger(tmp, body)
+            transactions = load_ledger(path)
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0].scenario_id, "KC")
+        self.assertEqual(transactions[0].amount, -100.0)
 
 
 class LoadLedgerEncodingTest(unittest.TestCase):

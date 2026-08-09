@@ -54,5 +54,52 @@ class ExtractAccountTokensSpacedHeaderTest(unittest.TestCase):
                 self.assertEqual(extract_account_tokens(f"Дело № {spaced} финансовый год"), (expected,))
 
 
+class ExtractAccountTokensGeneralizedPrefixTest(unittest.TestCase):
+    """Private dataset (2026-08-09): scenario KC's account_id is "TELE-4471",
+    not "ACC-<digits>" — the hardcoded "ACC" literal left KC with zero
+    matched documents. Confirmed live against the real ledger/documents.
+    """
+
+    def test_non_acc_prefix_plain_token(self) -> None:
+        text = "Счёт TELE-4471, обычный текст."
+        self.assertEqual(extract_account_tokens(text), ("TELE-4471",))
+
+    def test_non_acc_prefix_letter_spaced_title(self) -> None:
+        # The real confirmed private-dataset case.
+        text = "АУДИТОРСКОЕ ДЕЛО № T E L E - 4 4 7 1 / 2 0 2 5 ФИН.ГОД"
+        self.assertEqual(extract_account_tokens(text), ("TELE-4471",))
+
+    def test_acc_prefix_still_works_unaffected(self) -> None:
+        # Regression guard: broadening the letter class must not change the
+        # already-confirmed "ACC" behavior.
+        text = "Счёт ACC-7803, обычный текст."
+        self.assertEqual(extract_account_tokens(text), ("ACC-7803",))
+
+    def test_does_not_fuse_a_preceding_acronym_across_a_newline_gap(self) -> None:
+        # Real confirmed private-dataset bug: a first attempt at
+        # generalizing the spaced-title regex used unbounded "\s*" between
+        # letters, so "Halyk Bank of Kazakhstan JSC\n<many spaces>\nACC-7604"
+        # got spuriously matched as one span ("J","S","C","A","C","C") and
+        # destructively collapsed to "JSCACC-7604" — corrupting an
+        # otherwise-clean plain token.
+        text = "Halyk Bank of Kazakhstan JSC\n" + " " * 40 + "\nACC-7604\n\n\nCREDIT AGREEMENT"
+        self.assertEqual(extract_account_tokens(text), ("ACC-7604",))
+
+    def test_does_not_fuse_a_preceding_acronym_separated_by_one_space(self) -> None:
+        # Same bug class, single-space case: "AUDIT FILE REF ACC-7604" is
+        # ordinary prose (an acronym, a space, then a plain unspaced
+        # token) — not a letter-spaced artifact at all, and must not be
+        # touched by the spaced-title normalization.
+        text = "AUDIT FILE REF ACC-7604/FY2025"
+        self.assertEqual(extract_account_tokens(text), ("ACC-7604",))
+
+    def test_does_not_swallow_plain_token_preceded_by_a_label_word(self) -> None:
+        # Real confirmed private-dataset bug: "Account           ACC-7604"
+        # previously collapsed to "AccountACC-7604" under the same
+        # over-permissive whitespace unit, leaving zero valid tokens.
+        text = "Entity            Altai Metals Holding B.V.\nAccount           ACC-7604\nReport number AR-2025-0106"
+        self.assertEqual(extract_account_tokens(text), ("ACC-7604",))
+
+
 if __name__ == "__main__":
     unittest.main()
