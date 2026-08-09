@@ -10,12 +10,13 @@ genuinely "read this paragraph and tell me what it says" (covenant
 definitions, KYC facts, auditor reclassifications) — never to decide
 compliance itself. See `agentic-bank-public/CASE.ru.md` for the full rules.
 
-Entry points so far: `run_ingestion.py` (Block 1), `run_extraction.py`
-(Block 2), `run_linking.py` (Block 3a alone), `run_calculation.py` (Block
-3a+3b+3c, with an optional self-score against `ground_truth.json`). Blocks
-4 (Explanation) and 5 (`submission.json` assembly + validation) are not
-built yet — see "Running the full pipeline end-to-end" below for exactly
-what today's `HEAD` can and can't produce on its own.
+Entry points: `run_ingestion.py` (Block 1), `run_extraction.py` (Block 2),
+`run_linking.py` (Block 3a alone), `run_calculation.py` (Block 3a+3b+3c,
+with an optional self-score against `ground_truth.json`), `build_submission.py`
+(Block 5 — assembles `run_calculation.py`'s `--report` output into the
+literal `submission.json` shape, validated against `submission_template.json`).
+Block 4 (Explanation — a human-readable rationale per cell) is the only
+piece not built.
 
 ## Setup
 
@@ -78,16 +79,29 @@ python scripts/run_calculation.py -v --data-dir "$DATA_DIR" \
     --ground-truth "$DATA_DIR/ground_truth.json"   # omit for the private dataset
 ```
 
-**What step 4's output actually is, honestly:** `cache/calculation_results.json`
-is `{scenario_id: {covenant_key: {status, actual, evidence_txn_id}}}` for
-every required cell — the exact payload `submission.json`'s `answers` field
-needs. **Block 5 (assembling this into the literal `submission.json` shape
-— `team`/`contact_email`/`model` header, exact key layout, JSON validity
-check against `submission_template.json`) is not built yet.** Until it is,
-turning step 4's report into a valid submission is a manual (or
-soon-to-be-scripted) reshape, not a single command. Blocks 1–3 are the
-part that's genuinely "run and forget"; treat this README as needing a
-follow-up pass once Block 5 exists.
+**What step 4's output actually is:** `cache/calculation_results.json` is
+`{scenario_id: {covenant_key: {status, actual, evidence_txn_id, metric_type}}}`
+for every required cell. Feed it straight into Block 5:
+
+```bash
+# 5. Assemble the literal submission.json (team/contact_email/model header,
+#    exact key layout, cross-checked against submission_template.json —
+#    every required cell guaranteed present, missing ones printed loudly
+#    and filled null rather than silently dropped):
+python scripts/build_submission.py \
+    --results cache/calculation_results.json \
+    --template "$DATA_DIR/submission_template.json" \
+    --team "Our Team" --contact-email "team@example.com" \
+    --model "gpt-5.4-mini (dev profile)" \
+    --output submission.json
+```
+
+Exit code 0 means the written file round-tripped through the same
+structural validation the rest of the pipeline trusts. Exit code 1 means
+some required cell had no answer in `--results` — the message names the
+exact `scenario.covenant`; re-run that scenario with `--scenario <id>` and
+rebuild. Blocks 1–5 are all "run and forget" today; only Block 4
+(Explanation) remains unbuilt.
 
 ### Known sources of instability — read before assuming something's broken
 
@@ -119,6 +133,18 @@ follow-up pass once Block 5 exists.
   2–3 runs, not 5. Output tokens are the scarcer remaining resource —
   prompts that ask for long free-text explanations without a real need
   for them are a candidate to trim if budget gets tighter.
+- **`COVENANT_AGENT_PROFILE=final`'s actual measured cost** (2026-08-09,
+  private dataset, 2 representative scenarios): ~22,528 tokens/scenario for
+  the two budget-constrained call types (covenant_extraction +
+  transaction_categorization combined) — close to `dev`'s own per-scenario
+  average (~21,813, from the public 0.7394 run), so top-tier tokenomics
+  aren't dramatically worse in raw token count. The constraint is the
+  ~250k hard budget itself: a full 27-scenario `final` run needs
+  ~608k tokens for those two call types alone — 2.4× over budget. A full
+  27-scenario `final` run was nonetheless completed on 2026-08-09 by
+  explicit, conscious decision to exceed the advisory budget (925,958
+  tokens total, 601,489 of it top-tier) — see "Multiple submission
+  attempts" below.
 - **Rate limits.** `llm_client.py` retries with real backoff (up to ~6
   attempts, growing delay) — a run that logs several `rate limited`
   warnings and keeps going is working as intended, not stuck.
@@ -165,9 +191,15 @@ python scripts/run_ingestion.py -v --report cache/ingestion_report.json
   dossier, audit report, treasury memo), and how many older/draft versions
   were excluded.
 - `--report` dumps full metadata (minus raw text) as JSON for inspection.
-- `--data-dir` / `--cache-dir` override the defaults
-  (`agentic-bank-public/`, `cache/`) — point these at the private dataset on
-  the day without touching any code.
+- `--data-dir` / `--cache-dir` override the defaults, which every script
+  (`run_ingestion.py`/`run_extraction.py`/`run_linking.py`/
+  `run_calculation.py`, plus `build_submission.py`'s `--template` default)
+  reads from `config.py`'s `DEFAULT_DATA_DIR`/`DEFAULT_CACHE_DIR`.
+  **`DEFAULT_DATA_DIR` now points at `agentic-bank-hidden/` (updated
+  2026-08-09, once the private dataset shipped) — it no longer defaults to
+  `agentic-bank-public/`.** Always pass `--data-dir` explicitly when you
+  mean the public dataset (e.g. for a self-score control run); omitting it
+  silently targets the private dataset now, not the other way around.
 - Parsed PDF text is cached under `cache/pdf_text/`, keyed by a hash of the
   file's bytes, so re-running the pipeline doesn't re-shell out to
   `pdftotext` for unchanged files.
@@ -177,15 +209,19 @@ needed (see "Testing philosophy" at the end of this section for why real-API
 correctness is deliberately *not* part of this suite):
 
 ```bash
-python -m unittest discover -s tests -v   # all of the below in one go
+python -m unittest discover -s tests -v   # every test_*.py file in tests/, in one go
 ```
+
+One representative file per block — see the full 18-file inventory in
+"Architecture" below:
 
 | File | Covers |
 |---|---|
-| `test_resolution.py` | Block 1, against the real public dataset |
+| `test_resolution.py` | Block 1, against the real public dataset (explicitly, not via `DEFAULT_DATA_DIR`) |
 | `test_extraction_pipeline.py` | Block 2 orchestration wiring, mocked LLM calls |
 | `test_linking_utils.py` | Block 3a's non-LLM pieces: compound-description splitting, fuzzy counterparty matching, date/period parsing, reclassification linking, related-party threshold resolution |
 | `test_calculation.py` | Block 3b/3c: formulas by `metric_type`, period filtering, the `InsufficientDataError` fallback, and evidence's counterfactual logic — all on synthetic `LinkedScenarioData`, no real dataset needed |
+| `test_submission.py` | Block 5: `build_submission`'s pure assembly logic |
 
 **Testing philosophy:** the LLM-facing steps (2a/2b extraction, 3a
 categorization) are checked for *wiring* only — which document/category
@@ -229,12 +265,70 @@ python scripts/run_calculation.py -v --facts-cache cache/scenario_facts.json \
 ```
 
 Both load `--facts-cache` if it already exists (skipping Block 2 entirely)
-or run Block 2 live and populate it if not. `--scenario P1` limits either
-script to one scenario — genuinely limits the work done, not just the
-printed output (an earlier version of `run_calculation.py` linked all 12
-scenarios even with `--scenario` set, wasting ~30x the API calls for a
-"quick" single-scenario check; fixed, but a reminder to verify this kind
-of thing when adding scenario-scoping to a new script).
+or run Block 2 live and populate it if not. `--scenario P1` limits
+`run_calculation.py` to one scenario — genuinely limits the work done, not
+just the printed output (an earlier version linked all 12 scenarios even
+with `--scenario` set, wasting ~30x the API calls for a "quick"
+single-scenario check; fixed there).
+
+**`run_linking.py` does not have the same fix.** Confirmed live
+(2026-08-09): `python scripts/run_linking.py --scenario P1` **without** an
+existing `--facts-cache` still calls `extract_all_facts()` unscoped —
+every scenario's covenant/KYC/audit/fact extraction runs via the LLM
+before the result is narrowed down to just `P1` for linking/printing. If
+you want a genuinely cheap single-scenario linking check, either warm
+`--facts-cache` first via `run_calculation.py --scenario <id>
+--facts-cache ...`, or use `run_calculation.py`'s own linking output
+directly instead of this script until it's fixed.
+
+## Multiple submission attempts (dev vs final vs hybrid)
+
+The case allows up to 3 submission attempts, best-scoring one counts. On
+2026-08-09 (private dataset), this produced three candidate
+`submission.json` files, built independently so none overwrites another:
+
+```bash
+# 1. dev/mini — the proven baseline, one full run (facts-cache: cache/private_facts.json)
+python scripts/build_submission.py --results cache/private_results.json \
+    --template agentic-bank-hidden/submission_template.json \
+    --team "..." --contact-email "..." --model "gpt-5.4-mini (dev profile)" \
+    --output submission_dev.json
+
+# 2. final/top-tier — a second full run, COVENANT_AGENT_PROFILE=final
+#    (facts-cache: cache/private_facts_final.json, a separate path so it
+#    never collides with the dev run above)
+COVENANT_AGENT_PROFILE=final python scripts/run_calculation.py \
+    --data-dir agentic-bank-hidden -v \
+    --report cache/private_results_final.json \
+    --facts-cache cache/private_facts_final.json
+python scripts/build_submission.py --results cache/private_results_final.json \
+    --template agentic-bank-hidden/submission_template.json \
+    --team "..." --contact-email "..." --model "gpt-5.4 / gpt-5.4-mini (final profile)" \
+    --output submission_final.json
+```
+
+Comparing `submission_dev.json` and `submission_final.json` cell-by-cell
+(no ground truth exists for the private dataset, so this is agreement
+analysis, not a self-score) found 12/84 status disagreements. Manual,
+read-only diagnosis (comparing each side's raw `cache/llm_logs/` extraction
+and categorization output against the real source document and ledger
+rows) found dev more plausible on some cells (categorization gaps produce
+an honest `FALLBACK`) and final more plausible on others (an overly
+literal categorization sometimes produces an implausible extreme ratio;
+one case — F1 6.1 — was a confirmed `final`-side extraction bug: the model
+populated `threshold_value`/`threshold_unit` from the wrong sub-condition
+of a dual-condition covenant clause).
+
+A **third file, `submission_hybrid.json`**, was assembled by hand from
+this diagnosis — `submission_final.json` as the base, with 4 specific
+cells' `{status, actual, evidence_txn_id}` overridden verbatim from
+`submission_dev.json` where the manual read favored dev (F1 6.1, X3 6.3,
+X1 6.4, J4 5.2). This is a one-off manual JSON edit, not a scripted
+capability — there is no `--override` flag on `build_submission.py`; the
+override was done directly against the two already-built submission files
+with a short inline `json.load`/mutate/`json.dump` (no repo code changed).
+If this pattern recurs, it's a candidate for a real `build_submission.py`
+flag rather than repeating the manual edit.
 
 ## Architecture
 
@@ -311,27 +405,53 @@ scripts/
   run_extraction.py          CLI for Block 2
   run_linking.py             CLI for Block 3a alone
   run_calculation.py          CLI for Block 3a+3b+3c (+ optional self-scoring)
-  (all three print a per-model LLM usage summary unconditionally at the end)
+  build_submission.py         CLI for Block 5 — assembles run_calculation.py's
+                                 --report output into submission.json, validated
+                                 against submission_template.json
+  (the four run_*.py scripts print a per-model LLM usage summary
+   unconditionally at the end; build_submission.py is offline, no API calls)
 tests/
-  test_resolution.py         Block 1, against the real dataset (includes the
-                                financial_notes/segment_linking regression tests)
-  test_accounts.py            the letter-spaced-ACC-token normalization, synthetic
+  test_resolution.py         Block 1, against the real PUBLIC dataset only —
+                                hardcodes public scenario ids (P1/P5/P6/...),
+                                points DATA_DIR at agentic-bank-public/ explicitly
+                                regardless of DEFAULT_DATA_DIR
+  test_resolution_pipeline.py AccountLinkingRiskError, synthetic — the loud-stop
+                                 guard when an account_id convention doesn't match
+                                 ACCOUNT_TOKEN_RE at all
+  test_accounts.py            letter-spaced-token normalization + the generalized
+                                 <PREFIX>-<digits> match (was hardcoded "ACC-"),
+                                 synthetic
+  test_ledger.py              encoding/thousands-separator parsing + the
+                                 category-segmented txn_id shape ("TXN-KC-CAP-29"),
+                                 synthetic
+  test_versioning.py          supersede/draft-watermark detection, incl. the
+                                 "не применяется" false-positive and "draft"
+                                 substring-inside-"overdraft" false-positive fixes
+  test_classify.py            document-kind keyword scoring, incl. Kazakh markers
+                                 and English/template-variation synonym hardening
+  test_documents.py           a single corrupt/unparseable PDF must not take down
+                                 the rest of the corpus, mocked pdftotext
   test_segment_linking.py     the P5-shaped secondary linking mechanism, synthetic
   test_template_validation.py submission_template.json structural validation
   test_extraction_pipeline.py Block 2 orchestration, mocked LLM calls
   test_transaction_categorization.py  categorization prompt content (decoy guidance)
+  test_categories_specs.py    category-spec generation from a CovenantClause,
+                                 incl. sibling-borrow stem-dilution fixes
   test_linking_utils.py       Block 3a's non-LLM pieces, synthetic data
   test_linking_pipeline.py    Block 3a batch resilience + amount-correction patching
   test_calculation.py          Block 3b/3c, synthetic data (incl. other_facts,
                                   exclude_from_period, quarter-period inference)
+  test_calculation_pipeline.py calculate_covenant's carve_outs-not-applied
+                                  visibility logging, synthetic
+  test_submission.py          covenant_agent/submission.py's build_submission —
+                                 the pure assembly logic behind scripts/build_submission.py
   test_llm_client.py          per-model usage accounting, mocked (no real API call)
 ```
 
-Planned remaining blocks (not yet built): Explanation (assembling the
+Planned remaining block (not yet built): Explanation (assembling the
 evidence chain into a human-readable rationale per cell, from the
-provenance already threaded through every layer) and Submission assembly
-(reshaping `calculation_results.json` into the literal `submission.json`
-shape + validating it against `submission_template.json`).
+provenance already threaded through every layer). Submission assembly is
+built — see `build_submission.py` above.
 
 ## Design decisions worth knowing about
 
