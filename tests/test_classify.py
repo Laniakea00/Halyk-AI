@@ -89,6 +89,42 @@ class TemplateVariationRobustnessTest(unittest.TestCase):
         kind, score = classify_kind(text)
         self.assertEqual(kind, "credit_agreement")
 
+    def test_english_credit_agreement_by_structural_phrases(self) -> None:
+        # Real confirmed private-dataset gap: scenario J4's credit
+        # agreement is fully English ("Borrower"/"Lender" terminology,
+        # title "CREDIT AGREEMENT") — no Russian/Kazakh marker and no
+        # exact "loan agreement" phrase either, previously scored 0.
+        text = (
+            "CONFIDENTIAL · EXECUTION COPY\nCREDIT AGREEMENT\n"
+            "Senior Secured Credit Facility\n\n"
+            "THIS CREDIT AGREEMENT (this \"Agreement\") is made and entered "
+            "into as of 1 January 2025, by and between Altai Metals Holding "
+            "B.V. (the \"Borrower\") and Halyk Bank of Kazakhstan JSC, as "
+            "lender (the \"Lender\")."
+        )
+        kind, score = classify_kind(text)
+        self.assertEqual(kind, "credit_agreement")
+        self.assertGreaterEqual(score, 1)
+
+    def test_english_credit_agreement_phrases_do_not_override_a_referencing_financial_notes_doc(
+        self,
+    ) -> None:
+        # Regression guard: a financial_notes document that merely
+        # *references* "the credit agreement" / "the Borrower" as terms
+        # (real shape, J4's own financial_notes document) must not be
+        # misclassified — this is why the marker phrases added for the
+        # English credit_agreement gap are structural opening-formula text
+        # ("this credit agreement", "senior secured credit facility"), not
+        # the bare words that a reference would also contain.
+        text = (
+            "Примечания к финансовой отчётности\n\n"
+            "Раскрытия для агрегирования ковенантов. Как определено в "
+            "credit agreement, Borrower обязан раскрывать все внебалансовые "
+            "обязательства."
+        )
+        kind, score = classify_kind(text)
+        self.assertEqual(kind, "financial_notes")
+
     def test_other_kind_title_synonyms(self) -> None:
         cases = {
             "credit_agreement": "Кредитный договор между Банком и Заёмщиком",

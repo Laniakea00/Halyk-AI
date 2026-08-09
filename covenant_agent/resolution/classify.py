@@ -71,6 +71,20 @@ KIND_MARKERS: dict[str, tuple[str, ...]] = {
         # Template-variation hardening (2026-08-09) — see financial_notes.
         "кредитный договор",
         "договор о предоставлении кредита",
+        # Confirmed live gap (2026-08-09): scenario J4's credit agreement is
+        # a fully English-language document ("Borrower"/"Lender", title
+        # "CREDIT AGREEMENT") with zero Russian/Kazakh markers and no exact
+        # "loan agreement" phrase either — scored 0 and fell through to
+        # "other", leaving J4 with no current credit_agreement document at
+        # all. These two structural opening-formula/title phrases are
+        # deliberately specific (not "credit agreement"/"borrower" alone,
+        # which were checked and confirmed to false-positive on J4's own
+        # financial_notes document — a disclosure that legitimately
+        # *references* "the credit agreement" and "the Borrower" as terms
+        # without being one) — confirmed to hit only the two real J4
+        # credit_agreement documents and nowhere else in either corpus.
+        "this credit agreement",
+        "senior secured credit facility",
     ),
     "kyc_dossier": (
         "знай своего клиент",

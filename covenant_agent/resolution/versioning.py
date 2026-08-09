@@ -27,15 +27,26 @@ import re
 logger = logging.getLogger(__name__)
 
 # Specific multi-word phrases only — deliberately avoiding single ambiguous
-# words that could appear in a legitimate clause (e.g. a loan agreement's
-# own carve-out prose can plausibly contain "не применяется к..." in some
-# other context). Empirically, in the public dataset these exact phrases
-# occur only in the supersede watermark. If the private dataset starts
-# false-flagging real agreements, tighten these further.
+# words that could appear in a legitimate clause. Empirically, in the public
+# dataset these exact phrases occur only in the supersede watermark.
+#
+# "не применяется" ("does not apply") was removed after a confirmed live
+# false positive on the private dataset (2026-08-09): springing-covenant
+# carve-out prose routinely reads "...указанное ограничение ... не
+# применяется" (e.g. "while the leverage ratio does not exceed 3.00x, the
+# stated restriction does not apply") — ordinary contract text, not a
+# supersede watermark. This wrongly demoted the genuinely current 2025
+# credit agreement to "superseded" (alongside the real, correctly-flagged
+# 2024 one) across 6 real scenarios (B2, H2, J6, X1, X2, X3), leaving each
+# with zero current credit_agreement documents. Confirmed safe to drop:
+# every real supersede watermark in both corpora still carries at least one
+# of the remaining phrases below ("недействующая редакция" /
+# "заменена и изложена в новой редакции"), and removing this one phrase
+# flips is_superseded on exactly those 6 false-positive documents and
+# nothing in the public dataset.
 SUPERSEDE_MARKERS: tuple[str, ...] = (
     "недействующая редакция",
     "заменена и изложена в новой редакции",
-    "не применяется",
     "утратил силу",
     "утратила силу",
     "superseded",
@@ -57,6 +68,19 @@ DRAFT_MARKERS: tuple[str, ...] = (
     "черновик",
     "draft",
 )
+
+# DRAFT_MARKERS is matched with word boundaries (unlike SUPERSEDE_MARKERS'
+# plain substring check above) because "draft" is short enough to appear
+# inside an unrelated word — confirmed live on the private dataset
+# (2026-08-09): a financial_notes disclosure mentioning "an approved
+# overdraft facility" (ordinary English loanword in otherwise-Russian text)
+# matched the plain substring check and got the document wrongly flagged as
+# a draft, leaving scenario G3 with zero current financial_notes documents
+# (it was the only one for that scenario). Checked across both corpora:
+# every SUPERSEDE_MARKERS phrase is either multi-word or long enough that
+# no such false substring match actually occurs, so that list is left as a
+# plain substring check rather than adding unneeded complexity everywhere.
+_DRAFT_MARKER_RES = tuple(re.compile(r"\b" + re.escape(m) + r"\b") for m in DRAFT_MARKERS)
 
 # Revision markers always observed near the top of the document (header /
 # watermark block), so searching only the first ~2000 chars avoids false
@@ -83,7 +107,9 @@ _ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 def detect_supersede(text: str) -> tuple[bool, tuple[str, ...]]:
     lowered = text.lower()
     reasons = tuple(m for m in SUPERSEDE_MARKERS if m in lowered)
-    reasons += tuple(m for m in DRAFT_MARKERS if m in lowered)
+    reasons += tuple(
+        marker for marker, pattern in zip(DRAFT_MARKERS, _DRAFT_MARKER_RES) if pattern.search(lowered)
+    )
     return bool(reasons), reasons
 
 

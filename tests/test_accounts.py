@@ -97,8 +97,13 @@ class ExtractAccountTokensGeneralizedPrefixTest(unittest.TestCase):
         # Real confirmed private-dataset bug: "Account           ACC-7604"
         # previously collapsed to "AccountACC-7604" under the same
         # over-permissive whitespace unit, leaving zero valid tokens.
+        # "AR-2025-0106" (a report number, not an account) is also a
+        # legitimate match of the now-generalized token pattern — that's
+        # expected here; match_known_accounts() is the later step that
+        # filters tokens down to actual known account_ids, not this
+        # function.
         text = "Entity            Altai Metals Holding B.V.\nAccount           ACC-7604\nReport number AR-2025-0106"
-        self.assertEqual(extract_account_tokens(text), ("ACC-7604",))
+        self.assertEqual(extract_account_tokens(text), ("ACC-7604", "AR-2025-0106"))
 
 
 if __name__ == "__main__":

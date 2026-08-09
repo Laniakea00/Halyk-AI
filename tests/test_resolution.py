@@ -24,10 +24,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from covenant_agent.config import DEFAULT_DATA_DIR
+from covenant_agent.config import REPO_ROOT
 from covenant_agent.resolution.pipeline import run_ingestion
 
-DATA_DIR = DEFAULT_DATA_DIR
+# Hardcoded, not DEFAULT_DATA_DIR: this suite's assertions are specific to
+# the public dataset's own scenario ids/doc ids (P1, P5, P6, ...) — it must
+# keep validating against public data even after DEFAULT_DATA_DIR was
+# repointed at agentic-bank-hidden/ for the final run.
+DATA_DIR = REPO_ROOT / "agentic-bank-public"
 
 
 @unittest.skipUnless(DATA_DIR.exists(), f"public dataset not found at {DATA_DIR}")
