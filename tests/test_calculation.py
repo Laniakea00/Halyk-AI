@@ -1349,6 +1349,39 @@ class FindEvidenceTest(unittest.TestCase):
         self.assertEqual(result.status, "BREACH")
         self.assertEqual(result.evidence_txn_id, "PAY")
 
+    def test_evidence_txn_id_is_null_for_compliant_even_when_a_swing_exists(self) -> None:
+        # Organizer clarification (2026-08-09): evidence_txn_id is only
+        # ever populated for BREACH — null for every COMPLIANT cell, full
+        # stop. Confirmed as a real, live bug, not hypothetical: P10 6.1
+        # (status=COMPLIANT) returned evidence_txn_id='TXN-P10-0017' in
+        # both of today's confirmed 0.7394 runs. Real mechanism: a related-
+        # party denominator whose only contributing transaction, if
+        # excluded, would zero the denominator and blow the ratio past
+        # threshold — a genuine "swing", but the baseline itself is
+        # COMPLIANT, so it must never surface as evidence.
+        clause = _clause(
+            metric_type="ratio",
+            numerator_description="revenue",
+            denominator_description="платежи в пользу связанных сторон",
+            direction="max",
+            threshold_value=2.0,
+        )
+        match = RelatedPartyMatch(
+            ledger_counterparty="Related Co",
+            kyc_name="Related Co",
+            ownership_pct=25.0,
+            threshold_pct=20.0,
+            is_related=True,
+            basis="25.0% >= threshold 20.0%",
+        )
+        txns = [_txn("REV", 1000.0), _txn("PAY", -600.0, counterparty="Related Co")]
+        linked = _linked(
+            txns, category_specs=[NUM_SPEC], txn_category={"REV": "6.1_numerator"}, related_parties={"Related Co": match}
+        )
+        result = find_evidence(clause, linked)
+        self.assertEqual(result.status, "COMPLIANT")  # 1000/600 ~= 1.67 <= 2.0
+        self.assertIsNone(result.evidence_txn_id)
+
     def test_insufficient_data_in_counterfactual_is_skipped_not_crashed(self) -> None:
         # Reverting the only reclassified transaction would empty the
         # denominator entirely (0 matches) — this must be treated as "not

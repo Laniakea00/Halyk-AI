@@ -166,6 +166,28 @@ def find_evidence(clause: CovenantClause, linked: LinkedScenarioData) -> Evidenc
             notes[-1],
         )
 
+    # Organizer clarification (confirmed 2026-08-09): evidence_txn_id names
+    # the transaction *causing the breach* — it is null for every COMPLIANT
+    # cell, full stop, regardless of "accepts any value" language for
+    # ratio/aggregate tests. Confirmed as a real, live bug, not a
+    # hypothetical: P10 6.1 (status=COMPLIANT) returned
+    # evidence_txn_id='TXN-P10-0017' in both of today's confirmed runs — a
+    # related-party-exclusion swing was found (excluding that transaction
+    # would flip the verdict to BREACH), which is genuinely useful
+    # diagnostic information, but is a "what's keeping this compliant"
+    # fact, not "what's causing a breach" — the two are different
+    # questions, and only the second one is ever a valid evidence_txn_id
+    # per the case's own definition. The swing-detection above still runs
+    # unconditionally (its notes/logging are useful regardless of
+    # direction); only the final evidence_txn_id is gated here.
+    if baseline_status != "BREACH" and evidence_txn_id is not None:
+        notes.append(
+            f"evidence candidate {evidence_txn_id!r} found but suppressed — evidence_txn_id is "
+            f"only ever reported for BREACH; {baseline_status} always returns null regardless of "
+            f"what would flip it."
+        )
+        evidence_txn_id = None
+
     return EvidenceResult(
         actual=baseline_actual,
         status=baseline_status,
