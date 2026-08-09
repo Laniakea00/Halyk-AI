@@ -28,7 +28,9 @@ FALLBACK_STATUS = "COMPLIANT"
 FALLBACK_ACTUAL = 0.0
 
 
-def _fallback(scenario_id: str, covenant_key: str, reason: str) -> CovenantResult:
+def _fallback(
+    scenario_id: str, covenant_key: str, reason: str, *, metric_type: str | None = None
+) -> CovenantResult:
     logger.error(
         "Scenario %s covenant %s: FALLBACK (status=%s, actual=%s) — %s",
         scenario_id,
@@ -44,6 +46,7 @@ def _fallback(scenario_id: str, covenant_key: str, reason: str) -> CovenantResul
         evidence_txn_id=None,
         used_fallback=True,
         fallback_reason=reason,
+        metric_type=metric_type,
     )
 
 
@@ -68,7 +71,12 @@ def calculate_covenant(
             scenario_id, covenant_key, f"covenant key {covenant_key!r} was not returned by 2a extraction"
         )
     if linked is None:
-        return _fallback(scenario_id, covenant_key, "no linked ledger data available for this scenario")
+        return _fallback(
+            scenario_id,
+            covenant_key,
+            "no linked ledger data available for this scenario",
+            metric_type=clause.metric_type,
+        )
 
     if clause.carve_outs:
         # Idea 2 (offline audit): `carve_outs` is populated by 2a extraction
@@ -90,6 +98,27 @@ def calculate_covenant(
             clause.carve_outs,
         )
 
+    if clause.metric_type == "other":
+        # Structural-surprises audit finding: metric_type="other" falls
+        # into the exact same best-effort code path as "aggregate_amount"
+        # in formulas.py's compute_metric (a single summed magnitude vs.
+        # threshold_value) — it is NOT a truly general fallback. It's the
+        # single strongest available signal that 2a hit a covenant shape
+        # it couldn't fit into ratio/aggregate_amount/max_single_component
+        # at all (count-based, boolean/existence, multi-condition,
+        # date-based...) — the computed number won't crash, but may be
+        # silently wrong for that shape. Surfaced here, not just in
+        # CovenantResult.metric_type, so it's visible even to a reader who
+        # only checks the log, not the JSON report.
+        logger.warning(
+            "Scenario %s covenant %s: metric_type='other' — 2a could not fit this covenant into "
+            "ratio/aggregate_amount/max_single_component. Computed via the generic best-effort "
+            "sum-vs-threshold path; verify this cell manually if the covenant's actual shape "
+            "(count-based, boolean, multi-condition, date-based, ...) doesn't reduce to that.",
+            scenario_id,
+            covenant_key,
+        )
+
     try:
         result = find_evidence(clause, linked)
     except InsufficientDataError as exc:
@@ -98,12 +127,18 @@ def calculate_covenant(
             covenant_key,
             f"ratio denominator matched zero transactions — insufficient data to compute a "
             f"meaningful value ({exc})",
+            metric_type=clause.metric_type,
         )
     except Exception:
         logger.exception(
             "Scenario %s covenant %s: calculation raised unexpectedly", scenario_id, covenant_key
         )
-        return _fallback(scenario_id, covenant_key, "calculation raised an unexpected exception — see logs")
+        return _fallback(
+            scenario_id,
+            covenant_key,
+            "calculation raised an unexpected exception — see logs",
+            metric_type=clause.metric_type,
+        )
 
     return CovenantResult(
         covenant_key=covenant_key,
@@ -113,6 +148,7 @@ def calculate_covenant(
         used_fallback=False,
         fallback_reason=None,
         calculation_notes=result.notes,
+        metric_type=clause.metric_type,
     )
 
 

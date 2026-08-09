@@ -356,3 +356,14 @@ class CovenantResult:
     used_fallback: bool  # True only when there was no covenant rule to evaluate at all
     fallback_reason: str | None
     calculation_notes: tuple[str, ...] = ()  # human-readable trace, for debugging/explanation
+    # 2a's own metric_type for this clause, when known (None only for the
+    # earliest fallback paths that never got as far as resolving a clause
+    # at all). "aggregate_amount" and "other" share the exact same
+    # best-effort code path in formulas.py's compute_metric (see its
+    # docstring) — "other" specifically means 2a couldn't fit the clause
+    # into ratio/aggregate_amount/max_single_component at all, so this is
+    # the field to check for a structurally novel covenant shape the
+    # generic catch-all may have gotten semantically wrong even though it
+    # didn't crash. Internal/diagnostic only — never carried into the
+    # final submission file (see submission.py's _REQUIRED_CELL_FIELDS).
+    metric_type: str | None = None

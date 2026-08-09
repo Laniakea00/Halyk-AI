@@ -136,16 +136,44 @@ def _specs_for_clause(clause: CovenantClause) -> list[CategorySpec]:
 
     if clause.metric_type == "max_single_component":
         if clause.components:
-            return [
+            specs = [
                 CategorySpec(
                     key=f"{clause.covenant_key}_component_{i}",
                     covenant_key=clause.covenant_key,
                     role="component",
-                    description=f"{clause.metric_name}: {label}",
+                    # Deliberately just `label`, not "{metric_name}: {label}"
+                    # — confirmed real bug on P10's 6.3: the covenant's own
+                    # metric_name ("Минимальная выручка за вычетом
+                    # наибольшей статьи накладных расходов") leaked into a
+                    # *payroll* component's description, so its stems
+                    # (containing "выручка") made match_category_by_text
+                    # score it as a perfect false match for a sibling
+                    # covenant's *revenue* category during sibling-borrow.
+                    # `component_label` already carries the clean label
+                    # separately for display; `description` is what both
+                    # the LLM categorizer prompt and stem-matching actually
+                    # read, so it must stay a clean, single concept.
+                    description=label,
                     component_label=label,
                 )
                 for i, label in enumerate(clause.components)
             ]
+            # Prompt fix B (offline post-fix review, confirmed on P10 6.2):
+            # some max_single_component clauses measure some OTHER amount
+            # minus the largest component ("Выручка за вычетом наибольшей
+            # из величин..."), not the largest component on its own — the
+            # schema had no field to represent the "other amount" at all,
+            # so formulas.py could only ever return the bare max().
+            if clause.net_against_description:
+                specs.append(
+                    CategorySpec(
+                        key=f"{clause.covenant_key}_net_against",
+                        covenant_key=clause.covenant_key,
+                        role="net_against",
+                        description=clause.net_against_description,
+                    )
+                )
+            return specs
         # Extraction gap (2a returned max_single_component with no
         # components listed): fall back to a single aggregate bucket so
         # calculation still has *something* to sum, rather than silently
@@ -196,6 +224,22 @@ _ADDITIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Confirmed real bug on P5's 6.1 numerator: "...определяемые по
+# консолидированной отчётности конечной материнской компании Группы *и
+# включающие* затраты всех участников Группы" matched _ADDITIVE_RE on its
+# standalone "и" and got split into two sub-categories — but this "и" is
+# ordinary conjunction glue inside ONE continuous defining clause, not a
+# list of two summable financial concepts. The spurious second category
+# then attracted an unrelated operating-cost transaction into what should
+# have been a pure capex figure. A genuine additive/list construction
+# joins two noun phrases ("Арендных и Коммунальных расходов"); a
+# descriptive continuation instead resumes with a participle explaining/
+# qualifying what preceded it — narrow, targeted exclusion for exactly
+# that shape, not a general grammar parser.
+_DESCRIPTIVE_CONTINUATION_RE = re.compile(
+    r"^(включа\w*|определя\w*|предусматрива\w*|устанавлива\w*)", re.IGNORECASE
+)
+
 
 _MAX_COMPOUND_PARTS = 6  # safety cap against pathological/runaway splitting
 
@@ -241,6 +285,8 @@ def _split_compound(text: str) -> list[str]:
                     continue
                 a = match.group("a").strip(" (),.")
                 b = match.group("b").strip(" ().,")
+                if pattern is _ADDITIVE_RE and _DESCRIPTIVE_CONTINUATION_RE.match(b):
+                    continue
                 if a and b:
                     split = (_borrow_trailing_noun(a, b), b)
                     break
@@ -323,6 +369,33 @@ def _strip_defined_as_prefix(text: str) -> str:
     return match.group("definition") if match else text
 
 
+# Confirmed real gap on P3 and P7: both covenants' denominator_description
+# is the *bare* acronym "EBITDA" with no inline definition anywhere in
+# either source document (checked the full document text via the 2a
+# call's own input — "EBITDA" appears exactly once, inside the clause
+# itself, nowhere else). A category worded as literally "EBITDA" matches
+# zero ledger transactions by construction (nothing in a real ledger row
+# is ever described as "EBITDA") and forces InsufficientDataError.
+#
+# Every OTHER EBITDA-based covenant in this same dataset (B1, P4, P5)
+# defines it inline as "Выручка за вычетом Операционных расходов" and
+# _split_compound already handles that shape correctly — this alias only
+# fires for the residual case where the source text gives no definition
+# at all, applying the *same* convention the rest of the dataset already
+# establishes, not an invented one.
+_BARE_EBITDA_RE = re.compile(r"^\s*(?:показателя\s+)?EBITDA(?:\s+Заёмщика)?\s*$", re.IGNORECASE)
+
+
+def _expand_bare_ebitda(parts: list[str]) -> list[str]:
+    expanded: list[str] = []
+    for part in parts:
+        if _BARE_EBITDA_RE.match(part):
+            expanded.extend(["Выручка", "Операционных расходов"])
+        else:
+            expanded.append(part)
+    return expanded
+
+
 def _make_side_specs(
     covenant_key: str, role: str, description: str, *, allow_split: bool
 ) -> list[CategorySpec]:
@@ -332,6 +405,8 @@ def _make_side_specs(
     denominator_description callers — see _split_compound's docstring.
     """
     parts = _split_compound(description) if allow_split else [description]
+    if allow_split:
+        parts = _expand_bare_ebitda(parts)
     if len(parts) == 1:
         return [
             CategorySpec(

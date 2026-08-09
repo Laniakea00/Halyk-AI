@@ -40,6 +40,12 @@ def print_results(results: dict[str, dict[str, CovenantResult]]) -> None:
         for covenant_key in sorted(results[scenario_id]):
             r = results[scenario_id][covenant_key]
             flag = "  [FALLBACK: " + r.fallback_reason + "]" if r.used_fallback else ""
+            # Structural-surprises audit: metric_type="other" is the
+            # generic best-effort catch-all (see calculation/pipeline.py),
+            # not a truly general handler — flagged distinctly from a
+            # normal fallback so it's visible even skimming the console.
+            if r.metric_type == "other":
+                flag += "  [OTHER-TYPE: generic catch-all, verify manually]"
             print(
                 f"  {covenant_key}: status={r.status:10s} actual={r.actual:>14.2f}  "
                 f"evidence={r.evidence_txn_id}{flag}"
@@ -51,7 +57,12 @@ def print_results(results: dict[str, dict[str, CovenantResult]]) -> None:
 def _results_to_plain(results: dict[str, dict[str, CovenantResult]]) -> dict:
     return {
         sid: {
-            key: {"status": r.status, "actual": r.actual, "evidence_txn_id": r.evidence_txn_id}
+            key: {
+                "status": r.status,
+                "actual": r.actual,
+                "evidence_txn_id": r.evidence_txn_id,
+                "metric_type": r.metric_type,
+            }
             for key, r in covenants.items()
         }
         for sid, covenants in results.items()

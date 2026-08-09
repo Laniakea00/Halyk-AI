@@ -897,6 +897,108 @@ from wiring the newly-discovered documents' facts into calculation:
     field to represent, so it's always evaluated unconditionally). Design
     docs for both, not implementations, are below.
 
+### Third wave — the 9-cell forensic review and fix batch (2026-08-09)
+
+After two full 12-scenario dev-profile runs (self-score 0.6557 and 0.6283,
+mean 0.6420 vs. the 0.6237 post-`financial_notes`-fix baseline — not
+directly comparable to earlier 0.560/0.6149 figures, which predate that
+fix), 9 cells were wrong identically in both runs — not noise, the same
+class of "systematic, not random" signal documented earlier in this file.
+Each was traced offline, log by log (no new API calls), to a specific root
+cause before any fix was written. Full per-cell evidence (2a input,
+categorization output, ledger rows, exact numbers) lives in the session
+transcript; summarized findings and what got fixed:
+
+- **B1 6.1, P2 6.2** — plain transaction-categorization misses on
+  textbook-clean descriptions ("Plant operating and maintenance expenses",
+  "Purchase of blast freezer equipment") that the prompt's own existing
+  guidance already covers. Addressed by adding concrete worked few-shot
+  examples to `transaction_categorization.py`'s `SYSTEM_PROMPT` (a
+  different lever than the abstract rule that was already present and
+  still got missed) plus an explicit "re-check before unclassified"
+  instruction. **Checked whether the already-designed rule-based
+  pre-filter (below) could close this more cheaply — it cannot**: both
+  confirmed misses are cross-language (English transaction description,
+  Russian category description), and the prefilter's stem-overlap
+  machinery is language-blind by construction (`"опера"` and `"opera"`
+  share zero characters as Unicode strings, regardless of what they mean).
+  Not fixed by, or evidence against, the prefilter design itself — it
+  remains valid for same-language matches, just doesn't reach this case.
+- **P10 6.3** — a real, code-level bug, not a data limitation: a
+  `max_single_component` sub-category's description was built as
+  `f"{clause.metric_name}: {label}"`, so a *payroll* component inherited
+  the word "выручка" from its own covenant's unrelated metric name,
+  scoring a false-positive 1.0 sibling-borrow match against a different
+  covenant's real revenue category. Fixed in `categories.py`
+  (`_specs_for_clause`) — component descriptions are now just the clean
+  label.
+- **P4 6.1** — a ratio numerator matched zero transactions on both of its
+  sub-specs; `compute_metric` only ever checked the *denominator* for
+  `InsufficientDataError`, so the miss silently became a plausible-looking
+  `actual=0.0` (BREACH against a min threshold) instead of a loud
+  fallback. Fixed in `formulas.py` — the same zero-count check now applies
+  to the numerator too.
+- **P3 6.1, P7 6.1** — both covenants' EBITDA denominator is the bare,
+  undefined acronym "EBITDA", confirmed via full-text search to appear
+  nowhere else in either source document (2a's own prompt already
+  instructs decomposing an undefined acronym into "revenue minus operating
+  expenses", and still didn't in these two cases). Added a code-level
+  backstop in `categories.py`: a denominator/numerator that reduces to
+  bare "EBITDA" after splitting is now deterministically expanded into the
+  same "Выручка"/"Операционных расходов" convention every other
+  EBITDA-based covenant in this dataset already uses. P3 6.1 separately
+  involves an unapplied springing-covenant condition (Task C, still not
+  implemented — see below) and P3's own unapplied FX rate (see finding 15
+  above); the bare-EBITDA fix addresses only the denominator piece.
+- **P5 6.1** — two independent `categories.py`/`formulas.py` bugs, not
+  one: (1) `_split_compound`'s additive-connector regex mistook a
+  descriptive continuation clause ("...определяемые по консолидированной
+  отчётности... **и включающие** затраты всех участников Группы") for a
+  genuine two-concept list, spuriously splitting the capex numerator and
+  letting an unrelated operating-cost transaction into it — narrowed to
+  exclude continuations starting with `включа-`/`определя-`/etc.; (2) when
+  the whole "revenue net of opex" denominator missed, sibling-borrow only
+  ever found ONE sibling (revenue) using the combined description text,
+  silently dropping the opex deduction entirely — `_borrow_sibling_category_sum`
+  now borrows each part of a multi-spec role separately, so revenue and
+  opex can each find their own donor.
+- **P10 6.2** — a schema/extraction gap, not a categorization bug: the
+  clause measures "Выручка за вычетом наибольшей из величин..." (revenue
+  *minus* the larger of two components), but `CovenantClause` had no field
+  to represent the "other amount," so `max_single_component` could only
+  ever return the bare `max()` of the named components. Added
+  `net_against_description` to the schema, updated 2a's prompt to
+  populate it, and wired `formulas.py` to subtract the largest component
+  from that side's resolved sum (reusing the same sibling-borrow/rescue/
+  other_facts/addback machinery every ratio side already gets).
+- **P2 6.3, P6 6.1 — left as open questions, not fixed.** Both traced to a
+  likely structural data limitation rather than a code or prompt bug:
+  - *P2 6.3*: ground truth cites `TXN-P2-0012` (Zhetysu Capital Partners
+    LLP) as a related-party payment. P2's own KYC dossier is pure
+    boilerplate (identification/sanctions-screening process language, zero
+    named counterparties or ownership percentages) — checked every other
+    document in P2's corpus for a mention of that entity; the only hit is
+    an unrelated coincidence (the audit firm is also named "Zhetysu Audit &
+    Advisory LLP"). No document our pipeline reads discloses this
+    relationship.
+  - *P6 6.1*: ground truth cites `TXN-P6-0040` as a related-party payment,
+    but P6 has **no `kyc_dossier` document at all** in the 200-document
+    corpus — confirmed by grepping every cached PDF mentioning `ACC-7806`;
+    the only other two are a correctly-excluded draft audit workpaper and
+    a correctly-excluded superseded 2024 credit agreement, neither a KYC
+    document.
+
+  Since related-party determination is deliberately KYC-dossier-only by
+  design (matching each covenant's own stated rule — "определяется в
+  соответствии с... досье Заёмщика по идентификации клиента"), there is no
+  code or prompt fix available for either cell without inventing a
+  relationship the given documents don't disclose. **Worth raising with
+  the organizers directly** (there's apparently a channel for exactly this)
+  rather than guessing — it's possible the private dataset's KYC coverage
+  is more complete, or that the public dataset's ground truth relies on
+  information genuinely outside the provided corpus for these two cells
+  specifically.
+
 ## Draft design: rule-based pre-filter for transaction categorization (not implemented)
 
 Design only — no code changed for this section. Written now, while OpenAI

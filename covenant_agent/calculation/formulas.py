@@ -460,17 +460,83 @@ def _borrow_sibling_category_sum(
     before giving up" step InsufficientDataError's fallback used to skip
     straight past. Every borrow is logged at WARNING, clearly marked as a
     degraded match, not a confident primary one.
+
+    Fix 5 (offline post-fix review, confirmed on P5 6.1): when `role_specs`
+    has more than one spec — a netted role, e.g. "revenue net of opex"
+    split into two parts by categories.py's compound-splitting — a single
+    borrow attempt using the *combined* `description_text` only ever finds
+    ONE sibling category (typically whichever concept scores highest,
+    usually revenue) and completely misses that the other part (opex)
+    also needs its own deduction. Confirmed live: P5 6.1's EBITDA
+    denominator borrowed only a revenue sibling, silently dropping the
+    opex side entirely and inflating EBITDA. For a multi-spec role, this
+    borrows each part *separately* against its own focused description
+    and sums the results, so revenue and opex can each find their own
+    (possibly different) sibling donor.
+    """
+    if len(role_specs) > 1:
+        total = 0.0
+        count = 0
+        borrowed_keys: set[str] = set()
+        for spec in role_specs:
+            part_total, part_count, borrowed_key = _borrow_one_sibling(
+                spec.description,
+                linked,
+                clause,
+                excluded_txn_id=excluded_txn_id,
+                revert_txn_id=revert_txn_id,
+                log_context=f"{log_context} ({spec.component_label or spec.key})",
+                exclude_keys=borrowed_keys,
+            )
+            if borrowed_key is not None:
+                borrowed_keys.add(borrowed_key)
+            total += part_total
+            count += part_count
+        return total, count
+    total, count, _borrowed_key = _borrow_one_sibling(
+        description_text,
+        linked,
+        clause,
+        excluded_txn_id=excluded_txn_id,
+        revert_txn_id=revert_txn_id,
+        log_context=log_context,
+        exclude_keys=frozenset(),
+    )
+    return total, count
+
+
+def _borrow_one_sibling(
+    description_text: str | None,
+    linked: LinkedScenarioData,
+    clause: CovenantClause,
+    *,
+    excluded_txn_id: str | None,
+    revert_txn_id: str | None,
+    log_context: str,
+    exclude_keys: "set[str] | frozenset[str]",
+) -> tuple[float, int, str | None]:
+    """One sibling-covenant borrow attempt for a single, focused piece of
+    text — see _borrow_sibling_category_sum for the multi-part fan-out.
+    `exclude_keys` keeps a multi-part borrow from crediting the same
+    sibling category to two different parts of the same role (e.g. both
+    "revenue" and "opex" text coincidentally matching the same sibling).
+
+    Returns (total, count, borrowed_spec_key_or_None).
     """
     if not description_text:
-        return 0.0, 0
+        return 0.0, 0, None
     # Restricted to a genuinely *different* covenant — never another role
     # of the same covenant (numerator borrowing the denominator's
     # transactions, or vice versa, would rarely if ever be semantically
     # correct even if the text happened to stem-overlap).
-    sibling_pool = [s for s in linked.category_specs if s.covenant_key != clause.covenant_key]
+    sibling_pool = [
+        s
+        for s in linked.category_specs
+        if s.covenant_key != clause.covenant_key and s.key not in exclude_keys
+    ]
     match = match_category_by_text(description_text, sibling_pool)
     if match is None:
-        return 0.0, 0
+        return 0.0, 0, None
     sibling_spec, score = match
     sibling_covenant_specs = [s for s in linked.category_specs if s.covenant_key == sibling_spec.covenant_key]
     total, count = _category_signed_sum(
@@ -493,7 +559,8 @@ def _borrow_sibling_category_sum(
             score,
             count,
         )
-    return total, count
+        return total, count, sibling_spec.key
+    return total, count, None
 
 
 # Idea 1 (offline audit): a deterministic, last-resort rescue for the exact
@@ -689,6 +756,14 @@ def _derive_capex_from_nbv_roll_forward(other_facts: tuple[OtherFact, ...]) -> O
         return None
 
     capex = nbv_end.value - nbv_start.value + depreciation.value
+    logger.info(
+        "Derived capex from PP&E roll-forward: %.2f (NBV end %.2f - NBV start %.2f + "
+        "depreciation %.2f) — no ready-made capex figure was stated directly.",
+        capex,
+        nbv_end.value,
+        nbv_start.value,
+        depreciation.value,
+    )
     return OtherFact(
         # Deliberately short — match_category_by_text scores on stem
         # *overlap ratio* (matched / len(target_stems)), so padding this
@@ -824,7 +899,7 @@ def compute_metric(
     for counterfactuals) are responsible for catching it.
     """
     if clause.metric_type == "ratio":
-        numerator, _num_count = _resolve_side_sum(
+        numerator, num_count = _resolve_side_sum(
             clause,
             "numerator",
             clause.numerator_description,
@@ -840,6 +915,23 @@ def compute_metric(
             excluded_txn_id=excluded_txn_id,
             revert_txn_id=revert_txn_id,
         )
+        # Fix 2 (offline post-fix review, confirmed on P4 6.1): this used
+        # to check only the denominator. A numerator that matches zero
+        # transactions is the *same* "we don't know", not "genuinely zero",
+        # signal InsufficientDataError already exists to catch — but
+        # silently returning numerator=0.0 reads as a plausible, ordinary
+        # ratio result (e.g. a shortfall against a "min" threshold) instead
+        # of the obviously-fabricated numbers a bad denominator produces,
+        # so it's easy to miss. Confirmed as a real, live gap: P4 6.1's
+        # "Скорректированная EBITDA" numerator matched 0 transactions on
+        # both of its sub-specs, sibling-borrow and rescue both came up
+        # empty too, and the ratio silently computed 0/revenue = 0.0 —
+        # BREACH against a min threshold, with no fallback signal at all.
+        if num_count == 0 and _needs_data_check(clause.numerator_description):
+            raise InsufficientDataError(
+                f"covenant {clause.covenant_key}: numerator "
+                f"({clause.numerator_description!r}) matched 0 transactions"
+            )
         if den_count == 0 and _needs_data_check(clause.denominator_description):
             raise InsufficientDataError(
                 f"covenant {clause.covenant_key}: denominator "
@@ -911,7 +1003,31 @@ def compute_metric(
                 f"transactions across all {len(component_specs)} component(s)"
             )
         sums = [total for total, _count in component_results]
-        return max(sums) if sums else 0.0
+        largest = max(sums) if sums else 0.0
+
+        # Prompt fix B (offline post-fix review, confirmed on P10 6.2):
+        # "Выручка за вычетом наибольшей из величин..." measures some
+        # OTHER amount minus the largest component — not the largest
+        # component alone. Reuses _resolve_side_sum so this side gets the
+        # exact same safety nets (sibling-borrow, rescue, other_facts,
+        # addback) every ratio side already gets, not a stripped-down copy.
+        if clause.net_against_description:
+            net_amount, net_count = _resolve_side_sum(
+                clause,
+                "net_against",
+                clause.net_against_description,
+                linked,
+                excluded_txn_id=excluded_txn_id,
+                revert_txn_id=revert_txn_id,
+            )
+            if net_count == 0 and _needs_data_check(clause.net_against_description):
+                raise InsufficientDataError(
+                    f"covenant {clause.covenant_key}: net_against "
+                    f"({clause.net_against_description!r}) matched 0 transactions"
+                )
+            return net_amount - largest
+
+        return largest
 
     # aggregate_amount and other (best-effort fallback — see categories.py).
     magnitude, count = _resolve_side_sum(
