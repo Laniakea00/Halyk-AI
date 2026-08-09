@@ -18,6 +18,7 @@ import logging
 import re
 
 from covenant_agent.linking.categories import (
+    borrow_matching_text,
     is_related_party_text,
     is_unrestricted_subsidiary_text,
     match_category_by_text,
@@ -474,10 +475,17 @@ def _borrow_sibling_category_sum(
     and sums the results, so revenue and opex can each find their own
     (possibly different) sibling donor.
     """
+    # Fix #3 (post-fix forensic review): own_role_keys is always excluded
+    # from the candidate pool, regardless of which covenant(s) end up in
+    # scope for this attempt — matters once same-covenant candidates are
+    # allowed below (Adjusted-EBITDA/Revenue shape), where a role's own
+    # (already-confirmed-empty) sibling spec would otherwise self-match at
+    # score 1.0 and win over the genuinely different role we want.
+    own_role_keys = {s.key for s in role_specs}
     if len(role_specs) > 1:
         total = 0.0
         count = 0
-        borrowed_keys: set[str] = set()
+        borrowed_keys: set[str] = set(own_role_keys)
         for spec in role_specs:
             part_total, part_count, borrowed_key = _borrow_one_sibling(
                 spec.description,
@@ -500,7 +508,7 @@ def _borrow_sibling_category_sum(
         excluded_txn_id=excluded_txn_id,
         revert_txn_id=revert_txn_id,
         log_context=log_context,
-        exclude_keys=frozenset(),
+        exclude_keys=own_role_keys,
     )
     return total, count
 
@@ -519,22 +527,47 @@ def _borrow_one_sibling(
     text — see _borrow_sibling_category_sum for the multi-part fan-out.
     `exclude_keys` keeps a multi-part borrow from crediting the same
     sibling category to two different parts of the same role (e.g. both
-    "revenue" and "opex" text coincidentally matching the same sibling).
+    "revenue" and "opex" text coincidentally matching the same sibling) —
+    and, as of Fix #3, always includes the searching role's own spec keys
+    too (see caller), which matters now that same-covenant candidates are
+    allowed in the narrow case below.
 
     Returns (total, count, borrowed_spec_key_or_None).
     """
     if not description_text:
         return 0.0, 0, None
-    # Restricted to a genuinely *different* covenant — never another role
-    # of the same covenant (numerator borrowing the denominator's
-    # transactions, or vice versa, would rarely if ever be semantically
-    # correct even if the text happened to stem-overlap).
+    # Fix #1 (post-fix forensic review): use a short, targeted phrase for
+    # the match instead of a possibly-long, undecomposed description_text
+    # (aggregate_amount/other's formula_description in particular) — see
+    # borrow_matching_text's own docstring for why the long text alone
+    # dilutes the stem-overlap score to near-zero even when it names the
+    # right concept. No-op for already-short text (ratio numerator/
+    # denominator, component labels).
+    match_text = borrow_matching_text(description_text, clause.metric_name)
+    # Restricted to a genuinely *different* covenant — EXCEPT for one
+    # narrow, justified case (Fix #3, confirmed on P4 6.1): a ratio shaped
+    # "Adjusted EBITDA / Revenue" defines its numerator partly in terms of
+    # the exact same revenue figure the denominator needs on its own
+    # (Adjusted EBITDA = Revenue - OpEx + addback) — the categorizer can
+    # only assign the one real revenue transaction to ONE of the two, so
+    # the loser is a *correct*, not spurious, same-covenant donor. This is
+    # NOT a general same-covenant allowance: both the searching role's own
+    # text AND the candidate spec's own text must independently read as
+    # revenue-shaped (is_revenue_text), or the covenant-match restriction
+    # applies exactly as before. own_role_keys (folded into exclude_keys
+    # by the caller) still blocks a role from "matching" its own
+    # already-confirmed-empty sibling spec.
+    same_covenant_revenue_donor = is_revenue_text(description_text)
     sibling_pool = [
         s
         for s in linked.category_specs
-        if s.covenant_key != clause.covenant_key and s.key not in exclude_keys
+        if s.key not in exclude_keys
+        and (
+            s.covenant_key != clause.covenant_key
+            or (same_covenant_revenue_donor and is_revenue_text(s.description))
+        )
     ]
-    match = match_category_by_text(description_text, sibling_pool)
+    match = match_category_by_text(match_text, sibling_pool)
     if match is None:
         return 0.0, 0, None
     sibling_spec, score = match

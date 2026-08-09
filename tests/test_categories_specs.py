@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import unittest
 
-from covenant_agent.linking.categories import _split_compound, derive_category_specs
+from covenant_agent.linking.categories import _split_compound, borrow_matching_text, derive_category_specs
 from covenant_agent.schemas import CovenantClause, CovenantExtractionResult
 
 
@@ -165,6 +165,60 @@ class SplitCompoundNettingVsDescriptiveTest(unittest.TestCase):
     def test_genuine_netting_still_splits(self) -> None:
         parts = _split_compound("Выручка за вычетом Операционных расходов")
         self.assertEqual(len(parts), 2)
+
+
+class BorrowMatchingTextTest(unittest.TestCase):
+    """Fix #1 (post-fix forensic review): confirmed real bug — sibling-borrow
+    matching on aggregate_amount/other's full formula_description dilutes
+    the stem-overlap score to near-zero (33 stems, 1 shared -> 0.03,
+    nowhere near CATEGORY_MATCH_THRESHOLD=0.35) even when it names the
+    right concept. Real wording from P2 6.2 / P3 6.2.
+    """
+
+    P3_6_2_FORMULA = (
+        "Минимальный объём по статье «Выручка». Условием предоставления заёмных средств "
+        "является то, что совокупные поступления Shymkent Refinery Services JSC по "
+        "указанной статье за период с 2025-01-01 по 2025-12-31 будут не ниже $6,500,000.00. "
+        "Суммы, переквалифицированные независимым аудитором Заёмщика в состав финансовых "
+        "или иных неоперационных статей, в счёт исполнения настоящего ковенанта не "
+        "засчитываются независимо от их первоначального отражения в учёте."
+    )
+    P3_6_2_METRIC_NAME = "Минимальная выручка по категории"
+
+    P2_6_2_FORMULA = (
+        "Для целей настоящего ковенанта под расходами по статье «Капитальные затраты» "
+        "понимаются суммы, отнесённые к данной статье в аудированной финансовой "
+        "отчётности Заёмщика, включая суммы, переквалифицированные в неё независимым "
+        "аудитором Заёмщика, и за вычетом сумм, переквалифицированных аудитором из данной "
+        "статьи. Almaty Cold Chain JSC не вправе допускать, чтобы такие совокупные расходы "
+        "за период с 2025-01-01 по 2025-12-31 превысили $3,000,000.00."
+    )
+    P2_6_2_METRIC_NAME = "Максимальные расходы по категории"
+
+    def test_extracts_quoted_term_from_long_formula_description(self) -> None:
+        self.assertEqual(borrow_matching_text(self.P3_6_2_FORMULA, self.P3_6_2_METRIC_NAME), "Выручка")
+        self.assertEqual(
+            borrow_matching_text(self.P2_6_2_FORMULA, self.P2_6_2_METRIC_NAME), "Капитальные затраты"
+        )
+
+    def test_short_description_text_is_left_untouched(self) -> None:
+        # Must never touch already-short, already-working ratio
+        # numerator_description/denominator_description text.
+        self.assertEqual(borrow_matching_text("Выручка", "some unrelated metric name"), "Выручка")
+        self.assertEqual(
+            borrow_matching_text("Операционные расходы Заёмщика", "irrelevant"), "Операционные расходы Заёмщика"
+        )
+
+    def test_falls_back_to_metric_name_when_no_quoted_term(self) -> None:
+        long_no_quote = (
+            "Совокупная величина всех расходов, понесённых Заёмщиком в течение периода, "
+            "с учётом переквалификаций аудитора и без учёта разовых статей исключительного "
+            "характера, не должна превышать установленный лимит по итогам года"
+        )
+        self.assertEqual(borrow_matching_text(long_no_quote, "Капитальные затраты"), "Капитальные затраты")
+
+    def test_none_input_returns_none(self) -> None:
+        self.assertIsNone(borrow_matching_text(None, "some metric name"))
 
 
 if __name__ == "__main__":

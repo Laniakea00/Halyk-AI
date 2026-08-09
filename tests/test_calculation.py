@@ -61,10 +61,11 @@ def _clause(
     period_end="2025-12-31",
     components=None,
     net_against_description=None,
+    metric_name="Test Metric",
 ) -> CovenantClause:
     return CovenantClause(
         covenant_key=covenant_key,
-        metric_name="Test Metric",
+        metric_name=metric_name,
         metric_type=metric_type,
         formula_description=formula_description,
         numerator_description=numerator_description,
@@ -865,6 +866,120 @@ class SiblingCategoryBorrowTest(unittest.TestCase):
         clause = _clause(covenant_key="6.1", metric_type="max_single_component")
         actual = compute_metric(clause, linked)
         self.assertAlmostEqual(actual, 750.0)
+
+
+class SameCovenantRevenueBorrowTest(unittest.TestCase):
+    """Fix #3 (post-fix forensic review): real P4 6.1 shape — "Скорректированная
+    EBITDA / Выручка" (Adjusted EBITDA / Revenue). The numerator's own
+    revenue-part and the denominator both need the SAME real revenue
+    transaction; the categorizer gives it to only one. Narrow exception:
+    same-covenant borrowing is allowed only when BOTH the searching role's
+    text and the candidate spec's text read as revenue-shaped.
+    """
+
+    def test_denominator_borrows_numerators_revenue_part_within_same_covenant(self) -> None:
+        num_part0 = CategorySpec(
+            key="6.1_numerator_part0",
+            covenant_key="6.1",
+            role="numerator",
+            description="Скорректированная EBITDA, рассчитываемая как Выручка",
+        )
+        num_part1 = CategorySpec(
+            key="6.1_numerator_part1", covenant_key="6.1", role="numerator", description="Операционных расходов"
+        )
+        den = CategorySpec(key="6.1_denominator", covenant_key="6.1", role="denominator", description="Выручка")
+        txns = [_txn("REV", 7004318.47, description="Grain terminal throughput sales settlement 2025")]
+        linked = _linked(
+            txns,
+            category_specs=[num_part0, num_part1, den],
+            txn_category={"REV": "6.1_numerator_part0"},
+        )
+        clause = _clause(
+            covenant_key="6.1",
+            numerator_description="Скорректированная EBITDA, рассчитываемая как Выручка минус Операционных расходов",
+            denominator_description="Выручка",
+        )
+        actual = compute_metric(clause, linked)  # must not raise InsufficientDataError
+        # numerator = 7004318.47 (its own revenue part; opex part empty and
+        # not revenue-shaped, so it does NOT also borrow from the denominator)
+        # denominator = 7004318.47 (borrowed from the numerator's revenue part)
+        self.assertAlmostEqual(actual, 1.0)
+
+    def test_does_not_borrow_within_same_covenant_when_candidate_is_not_revenue_shaped(self) -> None:
+        # Denominator ("Выручка") is revenue-shaped, but the only same-
+        # covenant candidate (numerator, "Операционных расходов") is NOT —
+        # the exception must not fire just because the searching side is
+        # revenue; the candidate has to independently qualify too.
+        num = CategorySpec(key="6.1_numerator", covenant_key="6.1", role="numerator", description="Операционных расходов")
+        den = CategorySpec(key="6.1_denominator", covenant_key="6.1", role="denominator", description="Выручка")
+        txns = [_txn("OPEX", -500.0)]
+        linked = _linked(
+            txns,
+            category_specs=[num, den],
+            txn_category={"OPEX": "6.1_numerator"},
+        )
+        clause = _clause(covenant_key="6.1", numerator_description="Операционных расходов", denominator_description="Выручка")
+        with self.assertRaises(InsufficientDataError):
+            compute_metric(clause, linked)
+
+    def test_does_not_self_match_its_own_confirmed_empty_sibling_spec(self) -> None:
+        # Regression guard for the self-match trap Fix #3 introduced a risk
+        # of: once same-covenant candidates are allowed, a role's own
+        # (already-confirmed-empty) spec must never "match itself" at
+        # score 1.0 instead of a genuinely different role's populated one.
+        num = CategorySpec(key="6.1_numerator", covenant_key="6.1", role="numerator", description="Выручка")
+        den = CategorySpec(key="6.1_denominator", covenant_key="6.1", role="denominator", description="Выручка")
+        txns = [_txn("REV", 1000.0)]
+        linked = _linked(
+            txns,
+            category_specs=[num, den],
+            txn_category={"REV": "6.1_numerator"},
+        )
+        clause = _clause(covenant_key="6.1", numerator_description="Выручка", denominator_description="Выручка")
+        actual = compute_metric(clause, linked)
+        self.assertAlmostEqual(actual, 1.0)  # 1000 (own numerator) / 1000 (borrowed) — not 0/0 or a crash
+
+
+class AggregateAmountSiblingBorrowTest(unittest.TestCase):
+    """Fix #1 (post-fix forensic review): real P3 6.2 shape — an
+    aggregate_amount covenant whose own "amount" role is empty, needing to
+    borrow from a sibling covenant's category, using formula_description
+    (long, deliberately un-split) as the match text. Before this fix, the
+    long text diluted the stem-overlap score below threshold and this
+    covenant fell back to InsufficientDataError every time despite the
+    real transaction (TXN-P3-0010, $8,104,772.36) being correctly
+    categorized under a sibling covenant.
+    """
+
+    def test_borrows_using_quoted_term_from_long_formula_description(self) -> None:
+        # P3 6.1's own denominator (post bare-EBITDA split) — this is
+        # where the categorizer actually put the real revenue transaction.
+        sibling_revenue = CategorySpec(
+            key="6.1_denominator_part0", covenant_key="6.1", role="denominator", description="Выручка"
+        )
+        txns = [_txn("REV", 8104772.36, description="Refinery turnaround services sales settlement 2025")]
+        linked = _linked(
+            txns,
+            category_specs=[sibling_revenue],
+            txn_category={"REV": "6.1_denominator_part0"},
+        )
+        clause = _clause(
+            covenant_key="6.2",
+            metric_type="aggregate_amount",
+            numerator_description=None,
+            denominator_description=None,
+            formula_description=(
+                "Минимальный объём по статье «Выручка». Условием предоставления заёмных средств "
+                "является то, что совокупные поступления Shymkent Refinery Services JSC по "
+                "указанной статье за период с 2025-01-01 по 2025-12-31 будут не ниже $6,500,000.00. "
+                "Суммы, переквалифицированные независимым аудитором Заёмщика в состав финансовых "
+                "или иных неоперационных статей, в счёт исполнения настоящего ковенанта не "
+                "засчитываются независимо от их первоначального отражения в учёте."
+            ),
+            metric_name="Минимальная выручка по категории",
+        )
+        actual = compute_metric(clause, linked)  # must not raise InsufficientDataError
+        self.assertAlmostEqual(actual, 8104772.36)
 
 
 class RevenueRescueTest(unittest.TestCase):

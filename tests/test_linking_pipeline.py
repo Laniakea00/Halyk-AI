@@ -11,14 +11,16 @@ import unittest
 from unittest.mock import patch
 
 from covenant_agent.linking.pipeline import (
+    _addback_amounts,
     _apply_amount_corrections,
+    _collect_other_facts,
     _log_non_usd_transactions,
     link_all_scenarios,
     link_scenario,
 )
 from covenant_agent.linking.transaction_categorization import UNCLASSIFIED
-from covenant_agent.models import IngestionResult, ScenarioBundle, ScenarioFacts, Transaction
-from covenant_agent.schemas import AuditExtractionResult, TransactionAmountCorrection
+from covenant_agent.models import IngestionResult, LinkedReclassification, ScenarioBundle, ScenarioFacts, Transaction
+from covenant_agent.schemas import AuditExtractionResult, OtherFact, TransactionAmountCorrection
 
 
 def _txn(
@@ -181,6 +183,106 @@ class LogNonUsdTransactionsTest(unittest.TestCase):
         txns = [_txn("T1", "ACC-1", amount=-100.0, currency="USD")]
         with self.assertNoLogs("covenant_agent.linking.pipeline", level="WARNING"):
             _log_non_usd_transactions("X", txns)
+
+
+def _addback(txn_id: str) -> LinkedReclassification:
+    return LinkedReclassification(
+        txn_id=txn_id,
+        action="addback",
+        original_category="Разовые расходы на реструктуризацию",
+        reclassified_category=None,
+        reasoning="one-time item, auditor-approved addback",
+        source_doc_id="doc1",
+        match_confidence=1.0,
+        was_ambiguous=False,
+    )
+
+
+class AddbackAmountsTest(unittest.TestCase):
+    def test_returns_only_addback_transactions_amounts(self) -> None:
+        recategorize = LinkedReclassification(
+            txn_id="T2",
+            action="recategorize",
+            original_category="a",
+            reclassified_category="b",
+            reasoning="r",
+            source_doc_id="doc1",
+            match_confidence=1.0,
+            was_ambiguous=False,
+        )
+        reclassifications = {"T1": _addback("T1"), "T2": recategorize}
+        txns = [_txn("T1", "ACC-1", amount=-500.0), _txn("T2", "ACC-1", amount=-300.0)]
+        self.assertEqual(_addback_amounts(reclassifications, txns), [500.0])
+
+    def test_empty_when_no_addback_reclassifications(self) -> None:
+        recategorize = LinkedReclassification(
+            txn_id="T2",
+            action="recategorize",
+            original_category="a",
+            reclassified_category="b",
+            reasoning="r",
+            source_doc_id="doc1",
+            match_confidence=1.0,
+            was_ambiguous=False,
+        )
+        self.assertEqual(_addback_amounts({"T2": recategorize}, [_txn("T2", "ACC-1", amount=-300.0)]), [])
+
+
+class CollectOtherFactsDoubleCountGuardTest(unittest.TestCase):
+    """Fix #5 (post-fix forensic review): action="addback" and other_facts
+    come from the SAME extraction call over the SAME source text — nothing
+    in the schema stops the same one-time item from being reported in
+    both, which would double-count it (once via addback's net-logic
+    cancellation, again as a standalone other_fact). Not yet observed
+    live (no cached extraction has ever populated addback), but the
+    schema allows it, so this is covered synthetically.
+    """
+
+    def _audit(self, *facts: OtherFact) -> tuple:
+        return (
+            (
+                "doc1",
+                AuditExtractionResult(
+                    report_reference=None,
+                    is_final_position=True,
+                    reclassifications=[],
+                    other_facts=list(facts),
+                ),
+            ),
+        )
+
+    def test_fact_matching_an_addback_amount_is_dropped(self) -> None:
+        fact = OtherFact(
+            fact_description="Разовые расходы на реструктуризацию",
+            value=500.0,
+            unit="usd",
+            period=None,
+            source_quote="quote",
+        )
+        with self.assertLogs("covenant_agent.linking.pipeline", level="WARNING") as cm:
+            result = _collect_other_facts("X", self._audit(fact), addback_amounts=[500.0])
+        self.assertEqual(result, ())
+        self.assertTrue(any("double-counting" in msg for msg in cm.output))
+
+    def test_fact_not_matching_any_addback_amount_is_kept(self) -> None:
+        fact = OtherFact(
+            fact_description="Обязательство по программе выходных пособий",
+            value=918447.52,
+            unit="usd",
+            period=None,
+            source_quote="quote",
+        )
+        result = _collect_other_facts("X", self._audit(fact), addback_amounts=[500.0])
+        self.assertEqual(result, (fact,))
+
+    def test_no_addback_amounts_keeps_all_facts_unchanged(self) -> None:
+        # Regression guard: the pre-Fix-#5 behavior (no addback at all)
+        # must be completely unaffected.
+        fact = OtherFact(
+            fact_description="anything", value=42.0, unit="usd", period=None, source_quote="quote"
+        )
+        result = _collect_other_facts("X", self._audit(fact), addback_amounts=[])
+        self.assertEqual(result, (fact,))
 
 
 if __name__ == "__main__":

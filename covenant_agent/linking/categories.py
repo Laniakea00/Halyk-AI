@@ -479,6 +479,51 @@ def _stems(text: str) -> set[str]:
     }
 
 
+# Confirmed real bug on P3 6.2 (and structurally affects every
+# aggregate_amount/other covenant, ~half this dataset): sibling-borrow
+# matches using the full text passed in for that role — for
+# aggregate_amount/other's "amount" role, that's `formula_description`, a
+# deliberately un-split multi-sentence paraphrase (see _make_side_specs's
+# docstring for why splitting it is unsafe). match_category_by_text's
+# score is matched-stems / len(target_stems): a 33-stem paragraph with
+# exactly one shared stem scores ~0.03, nowhere near
+# CATEGORY_MATCH_THRESHOLD, even though the one shared word is the entire
+# real signal. Confirmed on real data, not a synthetic worry.
+#
+# This dataset's own covenant phrasing consistently quotes the exact
+# category name in Russian guillemets ("под расходами по статье
+# «Капитальные затраты» понимаются...", "Минимальный объём по статье
+# «Выручка»") — when present, that quoted phrase alone is a far cleaner
+# borrow-matching signal than the whole paragraph. `metric_name` is the
+# next-best fallback, but is sometimes too generic to help at all (P2
+# 6.2's own metric_name, "Максимальные расходы по категории", doesn't
+# even name which category — zero shared stems with "Капитальные
+# затраты"), so it's tried second, not combined with the quote (combining
+# just reintroduces dilution from the extra generic words).
+_QUOTED_TERM_RE = re.compile(r"«([^»]+)»")
+
+# Above this many stems, `description_text` is presumed to be a long
+# paraphrase, not a short focused phrase — below it, leave it alone
+# entirely (this must never touch the already-short, already-working
+# numerator_description/denominator_description/component-label text
+# ratio sides and max_single_component already borrow with correctly).
+_LONG_TEXT_STEM_LIMIT = 8
+
+
+def borrow_matching_text(description_text: str | None, metric_name: str | None) -> str | None:
+    """Best text to use for a sibling-borrow match attempt — see the
+    comment above for why this isn't just `description_text` unchanged.
+    """
+    if not description_text:
+        return description_text
+    if len(_stems(description_text)) <= _LONG_TEXT_STEM_LIMIT:
+        return description_text
+    quoted = _QUOTED_TERM_RE.search(description_text)
+    if quoted:
+        return quoted.group(1)
+    return metric_name or description_text
+
+
 def match_category_by_text(text: str, specs: list[CategorySpec]) -> tuple[CategorySpec, float] | None:
     """Best CategorySpec whose description text matches `text`, or None.
 

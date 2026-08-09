@@ -23,10 +23,10 @@ from dataclasses import replace
 from pathlib import Path
 
 from covenant_agent.linking.categories import derive_category_specs
-from covenant_agent.linking.reclassification_linking import link_reclassifications
+from covenant_agent.linking.reclassification_linking import _amounts_match, link_reclassifications
 from covenant_agent.linking.related_parties import resolve_related_parties
 from covenant_agent.linking.transaction_categorization import UNCLASSIFIED, categorize_transactions
-from covenant_agent.models import IngestionResult, LinkedScenarioData, ScenarioFacts, Transaction
+from covenant_agent.models import IngestionResult, LinkedReclassification, LinkedScenarioData, ScenarioFacts, Transaction
 from covenant_agent.schemas import AuditExtractionResult, OtherFact
 
 logger = logging.getLogger(__name__)
@@ -129,14 +129,66 @@ def _log_non_usd_transactions(scenario_id: str, transactions: list[Transaction])
     )
 
 
+def _addback_amounts(
+    reclassifications: dict[str, LinkedReclassification], transactions: list[Transaction]
+) -> list[float]:
+    """Ledger amounts behind every action="addback" reclassification for
+    this scenario — see _collect_other_facts for why these matter.
+    """
+    by_txn_id = {t.txn_id: t for t in transactions}
+    amounts = []
+    for reclass in reclassifications.values():
+        if reclass.action != "addback":
+            continue
+        txn = by_txn_id.get(reclass.txn_id)
+        if txn is not None and txn.amount is not None:
+            amounts.append(abs(txn.amount))
+    return amounts
+
+
 def _collect_other_facts(
+    scenario_id: str,
     audit_reports: "tuple[tuple[str, AuditExtractionResult], ...]",
+    addback_amounts: list[float],
 ) -> tuple[OtherFact, ...]:
     """Every OtherFact across every audit_report/financial_notes/treasury_memo
     disclosure for this scenario, flattened — see formulas.py's
     _resolve_side_sum for how these get matched to a covenant side.
+
+    Fix #5 (post-fix forensic review): `extract_audit_facts` produces
+    `reclassifications` and `other_facts` from the SAME LLM call over the
+    SAME source text — nothing stops it from reporting one real one-time
+    item twice, once as an action="addback" reclassification (already
+    linked to a ledger transaction, cancelled back into the covenant sum
+    via formulas.py's _addback_magnitude) and again as an independent
+    OtherFact with a matching dollar value (added again, on top, via
+    _other_facts_magnitude). Not yet observed live (no cached extraction
+    has ever populated action="addback"), but nothing in the schema
+    prevents it, and the failure mode is a silent double-count with no
+    error anywhere — the same risk *class* as the already-fixed
+    cross-covenant other_facts double-count, just between two fields of
+    one extraction instead of two covenants. A fact whose value matches an
+    addback's own transaction amount is dropped here, loudly, rather than
+    trusting the LLM never reports the same finding twice.
     """
-    return tuple(fact for _doc_id, audit in audit_reports for fact in audit.other_facts)
+    facts = []
+    for doc_id, audit in audit_reports:
+        for fact in audit.other_facts:
+            if fact.value is not None and any(
+                _amounts_match(abs(fact.value), amount) for amount in addback_amounts
+            ):
+                logger.warning(
+                    "Scenario %s: other_fact %r ($%.2f, from %s) matches an addback "
+                    "reclassification's own amount — dropped to avoid double-counting the same "
+                    "one-time item once via addback's net-logic and again as a standalone fact.",
+                    scenario_id,
+                    fact.fact_description,
+                    fact.value,
+                    doc_id,
+                )
+                continue
+            facts.append(fact)
+    return tuple(facts)
 
 
 def link_scenario(
@@ -211,7 +263,9 @@ def link_scenario(
         reclassifications=reclassifications,
         unmatched_reclassifications=unmatched,
         related_parties=related_parties,
-        other_facts=_collect_other_facts(facts.audit_reports),
+        other_facts=_collect_other_facts(
+            scenario_id, facts.audit_reports, _addback_amounts(reclassifications, transactions)
+        ),
     )
 
 
