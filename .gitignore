@@ -11,3 +11,4 @@ cache/
 # Provided hackathon dataset — static, re-downloadable, not our own work
 # product. Excluded to keep the repo focused on code we actually author.
 agentic-bank-public/
+agentic-bank-hidden/
