@@ -43,6 +43,36 @@ from covenant_agent.resolution.versioning import (
 
 logger = logging.getLogger(__name__)
 
+# Fraction of required scenarios missing a current credit_agreement above
+# which run_ingestion refuses to continue — see AccountLinkingRiskError.
+ACCOUNT_LINKING_RISK_THRESHOLD = 0.5
+
+
+class AccountLinkingRiskError(RuntimeError):
+    """Raised when a majority of required scenarios have no current
+    credit_agreement document at all.
+
+    Organizers have explicitly confirmed the credit agreement is always
+    present for every scenario in the private dataset (unlike KYC, which
+    is not guaranteed) — so a majority of scenarios missing one is not a
+    plausible "these borrowers happen to lack a credit agreement"
+    outcome. It is the strongest available signal that Block 1's
+    document-to-scenario linking failed structurally, most plausibly
+    because `resolution/accounts.py`'s `ACCOUNT_TOKEN_RE` hardcoded
+    "ACC-" prefix doesn't match this dataset's actual account_id
+    convention (a real, identified risk — see README's structural-
+    surprises audit) — every downstream block would otherwise run to
+    completion and quietly produce a full submission of
+    fallback-COMPLIANT cells for every single covenant, discovered only
+    by a human reading a suspiciously uniform result.
+
+    Deliberately raised from `run_ingestion` itself, not just the CLI
+    scripts, so every entrypoint (extraction/linking/calculation) that
+    calls it as a library function stops immediately too — there is no
+    point spending API budget on Block 2/3 against a dataset that
+    structurally can't be linked to any account.
+    """
+
 
 def _build_metadata(doc: ParsedDocument, known_account_ids: set[str]) -> DocumentMetadata:
     tokens = extract_account_tokens(doc.text)
@@ -169,6 +199,22 @@ def run_ingestion(data_dir: Path, cache_dir: Path) -> IngestionResult:
                 sid,
                 sorted(missing_kinds),
             )
+
+    scenarios_missing_credit_agreement = sorted(
+        sid for sid, bundle in scenarios.items() if "credit_agreement" not in bundle.current_documents
+    )
+    if scenario_ids and len(scenarios_missing_credit_agreement) / len(scenario_ids) >= ACCOUNT_LINKING_RISK_THRESHOLD:
+        raise AccountLinkingRiskError(
+            f"{len(scenarios_missing_credit_agreement)}/{len(scenario_ids)} required scenarios have "
+            f"NO current credit_agreement document — organizers confirmed this document kind is "
+            f"always present, so this many missing at once means document-to-scenario linking "
+            f"almost certainly failed structurally, not that these borrowers genuinely lack a "
+            f"credit agreement. Most likely cause: this dataset's account_id format doesn't match "
+            f"resolution/accounts.py's ACCOUNT_TOKEN_RE (hardcoded \"ACC-<digits>\" prefix) — "
+            f"before re-running, manually check a real account_id value from the ledger and from a "
+            f"document's own text and confirm they still look like \"ACC-1234\". "
+            f"Affected scenarios: {scenarios_missing_credit_agreement}"
+        )
 
     return IngestionResult(
         ledger=transactions,

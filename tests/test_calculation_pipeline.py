@@ -17,11 +17,11 @@ from covenant_agent.models import LinkedScenarioData, ScenarioFacts
 from covenant_agent.schemas import CovenantClause, CovenantExtractionResult
 
 
-def _clause(carve_outs) -> CovenantClause:
+def _clause(carve_outs, metric_type="aggregate_amount") -> CovenantClause:
     return CovenantClause(
         covenant_key="6.1",
         metric_name="Test Metric",
-        metric_type="aggregate_amount",
+        metric_type=metric_type,
         formula_description="выплаты в пользу связанных сторон",
         numerator_description=None,
         denominator_description=None,
@@ -77,6 +77,41 @@ class CarveOutsVisibilityTest(unittest.TestCase):
         with_carveout = calculate_covenant("X1", "6.1", _facts(_clause(["some condition"])), _linked())
         self.assertEqual(without.status, with_carveout.status)
         self.assertEqual(without.actual, with_carveout.actual)
+
+
+class MetricTypeVisibilityTest(unittest.TestCase):
+    """Structural-surprises audit: metric_type='other' shares formulas.py's
+    generic aggregate_amount catch-all path, not a truly general handler —
+    must be visible in the calculation report, not just debug logs.
+    """
+
+    def test_metric_type_is_carried_into_the_result_on_success(self) -> None:
+        clause = _clause([], metric_type="aggregate_amount")
+        result = calculate_covenant("X1", "6.1", _facts(clause), _linked())
+        self.assertEqual(result.metric_type, "aggregate_amount")
+
+    def test_other_metric_type_logs_a_distinct_warning(self) -> None:
+        clause = _clause([], metric_type="other")
+        with self.assertLogs("covenant_agent.calculation.pipeline", level="WARNING") as cm:
+            result = calculate_covenant("X1", "6.1", _facts(clause), _linked())
+        self.assertEqual(result.metric_type, "other")
+        self.assertTrue(any("metric_type='other'" in message for message in cm.output))
+
+    def test_aggregate_amount_does_not_trigger_the_other_type_warning(self) -> None:
+        clause = _clause([], metric_type="aggregate_amount")
+        with self.assertNoLogs("covenant_agent.calculation.pipeline", level="WARNING"):
+            calculate_covenant("X1", "6.1", _facts(clause), _linked())
+
+    def test_metric_type_is_carried_into_fallback_results_too(self) -> None:
+        clause = _clause([], metric_type="ratio")
+        result = calculate_covenant("X1", "6.1", _facts(clause), linked=None)
+        self.assertTrue(result.used_fallback)
+        self.assertEqual(result.metric_type, "ratio")
+
+    def test_metric_type_is_none_when_no_clause_was_ever_resolved(self) -> None:
+        result = calculate_covenant("X1", "6.1", facts=None, linked=_linked())
+        self.assertTrue(result.used_fallback)
+        self.assertIsNone(result.metric_type)
 
 
 if __name__ == "__main__":
